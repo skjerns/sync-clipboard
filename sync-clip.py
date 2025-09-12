@@ -541,6 +541,13 @@ class TrayApp:
         self.tray.setToolTip('Clipboard Sync (Nextcloud)')
         self.menu = QtWidgets.QMenu()
 
+        # Top label showing current host/node id
+        host_text = f'Host: {self.ncsync.node_id}'
+        self.host_label = QtGui.QAction(host_text, self.menu)  # QAction comes from QtGui
+        self.host_label.setEnabled(False)  # label-like, non-interactive
+        self.menu.addAction(self.host_label)
+        self.menu.addSeparator()
+
         self.act_send = self.menu.addAction('Send'); self.act_send.setCheckable(True)
         self.act_receive = self.menu.addAction('Receive'); self.act_receive.setCheckable(True)
         self.act_notify = self.menu.addAction('Notifications'); self.act_notify.setCheckable(True)
@@ -560,6 +567,7 @@ class TrayApp:
         self.timer = QtCore.QTimer()
         self.timer.setInterval(int(self.ncsync.interval * 1000))
         self.timer.timeout.connect(self.ncsync.tick)
+
 
     def _icon(self):
         candidates = [
