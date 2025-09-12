@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import os, sys, time, json, hashlib, tempfile, glob, shutil, subprocess, atexit
+import os, sys, time, json, hashlib, tempfile, glob, shutil, subprocess, atexit, base64
+import socket
 
 # Optional Qt (PyQt5 preferred; fall back to PySide6)
 Qt = None
@@ -18,18 +19,11 @@ except Exception:
         QtGui = None
         QtCore = None
 
-
-    
-#%% PATCH DNS
-# --- install DNS patch BEFORE importing nc_py_api ---
-import socket
-
-# Configure your overrides here
+# PATCH DNS
 DNS_MAP = {
-    "drive.skjerns.de": "91.204.46.106",   # add more host->ip as needed
+    "drive.skjerns.de": "91.204.46.106",
 }
 
-# Keep originals so we can restore later
 _ORIG_GETADDRINFO = socket.getaddrinfo
 _ORIG_GETHOSTBYNAME_EX = socket.gethostbyname_ex
 
@@ -37,7 +31,6 @@ def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
     """Resolve select hosts to fixed IPs; otherwise defer to system resolver."""
     if host in DNS_MAP:
         ip = DNS_MAP[host]
-        # Decide families. Respect caller's family if constrained.
         fams = []
         if family and family != socket.AF_UNSPEC:
             fams = [family]
@@ -48,7 +41,6 @@ def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
                 fams.append(socket.AF_INET)
             if not fams:
                 fams = [socket.AF_INET]
-
         results = []
         for fam in fams:
             sockaddr = (ip, port, 0, 0) if fam == socket.AF_INET6 else (ip, port)
@@ -68,20 +60,11 @@ def unpatch_dns():
     socket.getaddrinfo = _ORIG_GETADDRINFO
     socket.gethostbyname_ex = _ORIG_GETHOSTBYNAME_EX
 
-# Activate patch globally
 socket.getaddrinfo = _patched_getaddrinfo
 socket.gethostbyname_ex = _patched_gethostbyname_ex
-# --- end DNS patch installation ---
 
-
-# Now import and use nc_py_api; it will inherit the patched resolver
 # Nextcloud WebDAV client
 from nc_py_api import Nextcloud
-
-# If/when you want to restore system DNS:
-# unpatch_dns()
-
-#%%
 
 APP_NAME = 'clip_sync'
 STATE_FILE = os.path.join(os.path.expanduser('~'), '.config', 'clip_sync', 'state.json')
@@ -92,8 +75,11 @@ def log(msg):
     ts = time.strftime('%H:%M:%S')
     print(f'[{ts}] {msg}', flush=True)
 
+def sha256_bytes(b):
+    return hashlib.sha256(b).hexdigest()
+
 def sha256_text(s):
-    return hashlib.sha256(s.encode('utf-8', 'ignore')).hexdigest()
+    return sha256_bytes(s.encode('utf-8', 'ignore'))
 
 def ensure_dir(p):
     d = os.path.dirname(p)
@@ -177,7 +163,7 @@ class Settings:
         })
 
 class Clipboard:
-    """Clipboard access via wl-clipboard, xclip, or Tk."""
+    """Clipboard access for text and images via wl-clipboard, xclip, or Tk(text-only)."""
     def __init__(self):
         self.mode = None
         self.tk = None
@@ -194,7 +180,8 @@ class Clipboard:
             except Exception:
                 self.mode = None
 
-    def get(self):
+    # ----- TEXT -----
+    def get_text(self):
         if self.mode == 'wl':
             try:
                 out = subprocess.run(['wl-paste','--no-newline'], capture_output=True, text=True)
@@ -215,7 +202,7 @@ class Clipboard:
                 return ''
         return ''
 
-    def set(self, text):
+    def set_text(self, text):
         if self.mode == 'wl':
             try:
                 p = subprocess.Popen(['wl-copy'], stdin=subprocess.PIPE, text=True)
@@ -239,6 +226,91 @@ class Clipboard:
             except Exception:
                 return False
         return False
+
+    # ----- IMAGES -----
+    def _list_types(self):
+        """Return a set of MIME types available for the current clipboard contents."""
+        types = set()
+        try:
+            if self.mode == 'wl':
+                p = subprocess.run(['wl-paste', '--list-types'], capture_output=True, text=True)
+                if p.returncode == 0:
+                    for line in p.stdout.splitlines():
+                        t = line.strip()
+                        if t: types.add(t)
+            elif self.mode == 'xclip':
+                p = subprocess.run(['xclip','-selection','clipboard','-t','TARGETS','-o'], capture_output=True, text=True)
+                if p.returncode == 0:
+                    for line in p.stdout.split():
+                        # xclip prints atoms; filter typical image types
+                        if line.startswith('image/'):
+                            types.add(line)
+        except Exception:
+            pass
+        return types
+
+    def get_image(self):
+        """Return (mime, bytes) if an image is present; else (None, b'')."""
+        types = self._list_types()
+        candidates = [t for t in ('image/png','image/jpeg','image/jpg') if t in types]
+        if not candidates:
+            return (None, b'')
+        mime = candidates[0]
+        try:
+            if self.mode == 'wl':
+                p = subprocess.run(['wl-paste','-t', mime], capture_output=True)
+                if p.returncode == 0:
+                    return (mime, p.stdout or b'')
+            elif self.mode == 'xclip':
+                p = subprocess.run(['xclip','-selection','clipboard','-t', mime, '-o'], capture_output=True)
+                if p.returncode == 0:
+                    return (mime, p.stdout or b'')
+        except Exception:
+            pass
+        return (None, b'')
+
+    def set_image(self, mime, data):
+        """Set image to clipboard; returns True on success."""
+        if mime not in ('image/png','image/jpeg','image/jpg'):
+            return False
+        try:
+            if self.mode == 'wl':
+                p = subprocess.Popen(['wl-copy','-t', mime], stdin=subprocess.PIPE)
+                p.communicate(data)
+                return p.returncode == 0
+            elif self.mode == 'xclip':
+                p = subprocess.Popen(['xclip','-selection','clipboard','-t', mime, '-i'], stdin=subprocess.PIPE)
+                p.communicate(data)
+                return p.returncode == 0
+        except Exception:
+            return False
+        return False
+
+    # ----- Unified payload API used by sync layer -----
+    def get_payload(self):
+        """Return a dict describing current clipboard content (text or image)."""
+        mime, img = self.get_image()
+        if mime and img:
+            return {'format': 'image', 'mime': mime, 'data': img}
+        text = self.get_text()
+        return {'format': 'text', 'text': text}
+
+    def apply_payload(self, payload):
+        """Apply incoming payload to local clipboard."""
+        fmt = payload.get('format')
+        if fmt == 'image':
+            mime = payload.get('mime')
+            data_b64 = payload.get('data_b64')
+            if not mime or not data_b64:
+                return False
+            try:
+                buf = base64.b64decode(data_b64.encode('ascii'), validate=True)
+            except Exception:
+                return False
+            return self.set_image(mime, buf)
+        # default to text
+        text = payload.get('text', payload.get('content', ''))
+        return self.set_text(text)
 
 class Notifier:
     """Tray bubbles or notify-send fallback."""
@@ -264,8 +336,9 @@ class Notifier:
         log(f'NOTICE {title}: {message}')
 
 class NcSync:
-    """Nextcloud WebDAV clipboard sync with per-node files."""
-    def __init__(self, url, user, app_password, remote_dir, node_id, cb, settings, notifier, interval=0.5, max_bytes=1_000_000):
+    """Nextcloud WebDAV clipboard sync with per-node files (text + images)."""
+    def __init__(self, url, user, app_password, remote_dir, node_id, cb, settings, notifier,
+                 interval=0.5, max_bytes=1_000_000, max_image_bytes=6_000_000):
         self.url = url
         self.user = user
         self.app_password = app_password
@@ -276,6 +349,7 @@ class NcSync:
         self.notifier = notifier
         self.interval = interval
         self.max_bytes = max_bytes
+        self.max_image_bytes = max_image_bytes
 
         self.nc = None
         self.my_rel = f'{self.remote_dir}/{self.node_id}.clip.json'
@@ -295,11 +369,10 @@ class NcSync:
 
     def _snapshot_start_state(self):
         try:
-            init_text = self.cb.get() or ''
-            self.last_local_hash = sha256_text(init_text)
+            init = self.cb.get_payload()
+            self.last_local_hash = self._hash_payload(init)
         except Exception:
             self.last_local_hash = None
-        # Snapshot existing peers so we ignore history
         try:
             log(f'LIST {self.remote_dir} (snapshot, no-sync-on-start)')
             for n in self.nc.files.listdir(self.remote_dir, depth=1, exclude_self=True):
@@ -314,7 +387,6 @@ class NcSync:
             pass
 
     def _list_peers(self):
-        """Return {name: (node, etag)}."""
         out = {}
         try:
             log(f'LIST {self.remote_dir}')
@@ -350,6 +422,26 @@ class NcSync:
             except Exception:
                 pass
 
+    def _hash_payload(self, payload):
+        """Stable hash for change detection across text and images."""
+        fmt = payload.get('format')
+        if fmt == 'image':
+            mime = payload.get('mime','')
+            data = payload.get('data')
+            if isinstance(data, bytes):
+                raw = b'IMG\0' + mime.encode('utf-8','ignore') + b'\0' + data
+            else:
+                # when coming in via JSON pull
+                b64 = payload.get('data_b64','').encode('ascii', 'ignore')
+                try:
+                    raw = b'IMG\0' + mime.encode('utf-8','ignore') + b'\0' + base64.b64decode(b64, validate=False)
+                except Exception:
+                    raw = b'IMG\0' + mime.encode('utf-8','ignore') + b'\0'
+            return sha256_bytes(raw)
+        # text
+        text = payload.get('text', payload.get('content', ''))
+        return sha256_text(text)
+
     def _pull(self):
         peers = self._list_peers()
         for name, (node, etag) in peers.items():
@@ -363,37 +455,71 @@ class NcSync:
                 log(f'SKIP own-origin from {name}')
                 self.peer_etags[name] = etag
                 continue
-            content = data.get('content', '')
-            h = data.get('hash') or sha256_text(content)
+
+            # Back-compat: old format had only text
+            if 'format' not in data:
+                payload = {'format': 'text', 'text': data.get('content', '')}
+            else:
+                payload = data
+
+            h = data.get('hash') or self._hash_payload(payload)
             if h and h == self.last_local_hash:
                 log('SKIP same-hash as local')
                 self.peer_etags[name] = etag
                 continue
-            applied = self.cb.set(content)
+
+            applied = self.cb.apply_payload(payload)
             if applied:
                 self.last_local_hash = h
                 self.peer_etags[name] = etag
-                log(f'APPLY from {origin} ({len(content)} chars)')
-                self.notifier.notify('Clipboard received', f'From {origin}')
+                kind = payload.get('format')
+                if kind == 'image':
+                    size = len(payload.get('data_b64',''))
+                    log(f'APPLY image from {origin} (~{size*3//4} bytes)')
+                    self.notifier.notify('Clipboard received', f'Image from {origin}')
+                else:
+                    text = payload.get('text','')
+                    log(f'APPLY text from {origin} ({len(text)} chars)')
+                    self.notifier.notify('Clipboard received', f'From {origin}')
 
     def _push(self):
         try:
-            text = self.cb.get() or ''
-            enc = text.encode('utf-8','ignore')
-            if len(enc) > self.max_bytes:
-                enc = enc[:self.max_bytes]
-                text = enc.decode('utf-8','ignore')
-            h = sha256_text(text)
-            if h != self.last_local_hash:
-                payload = {
+            payload = self.cb.get_payload()
+            fmt = payload.get('format')
+
+            if fmt == 'image':
+                mime = payload.get('mime')
+                data = payload.get('data') or b''
+                if not data or not mime:
+                    return
+                if len(data) > self.max_image_bytes:
+                    data = data[:self.max_image_bytes]
+                b64 = base64.b64encode(data).decode('ascii')
+                out = {
                     'origin': self.node_id,
                     'ts': int(time.time()),
-                    'hash': h,
-                    'format': 'text',
-                    'content': text
+                    'format': 'image',
+                    'mime': mime,
+                    'data_b64': b64,
                 }
-                log(f'SEND update ({len(text)} chars)')
-                self._upload_atomic(self.my_rel, json.dumps(payload, ensure_ascii=False))
+            else:
+                text = payload.get('text') or ''
+                enc = text.encode('utf-8','ignore')
+                if len(enc) > self.max_bytes:
+                    enc = enc[:self.max_bytes]
+                    text = enc.decode('utf-8','ignore')
+                out = {
+                    'origin': self.node_id,
+                    'ts': int(time.time()),
+                    'format': 'text',
+                    'text': text
+                }
+
+            h = self._hash_payload(payload if fmt == 'image' else {'format':'text','text':out['text']})
+            if h != self.last_local_hash:
+                out['hash'] = h
+                log(f'SEND update ({fmt})')
+                self._upload_atomic(self.my_rel, json.dumps(out, ensure_ascii=False))
                 self.last_local_hash = h
                 self.notifier.notify('Clipboard sent', 'Shared via Nextcloud')
         except Exception:
@@ -508,14 +634,18 @@ def load_creds_json(path):
     return {'url': url, 'user': user, 'app_password': app_password, 'remote_dir': remote_dir}
 
 def parse_args(argv):
-    """Usage: script <node-id> [--creds ./credentials.json] [--interval 0.5]"""
-    if len(argv) < 2 or argv[1].startswith('-'):
-        print('Usage: clip_sync_nextcloud.py <node-id> [--creds ./credentials.json] [--interval 0.5]')
-        sys.exit(2)
-    node_id = argv[1]
+    """Usage: script [<node-id>] [--creds ./credentials.json] [--interval 0.5]"""
     creds = './credentials.json'
     interval = 0.5
-    i = 2
+    node_id = None
+    i = 1
+
+    if i < len(argv) and not argv[i].startswith('-'):
+        node_id = argv[i]
+        i += 1
+    else:
+        node_id = socket.gethostname()
+
     while i < len(argv):
         a = argv[i]
         if a == '--creds':
@@ -532,8 +662,9 @@ def parse_args(argv):
             i += 2
         else:
             print(f'Unknown argument: {a}')
-            print('Usage: clip_sync_nextcloud.py <node-id> [--creds ./credentials.json] [--interval 0.5]')
+            print('Usage: clip_sync_nextcloud.py [<node-id>] [--creds ./credentials.json] [--interval 0.5]')
             sys.exit(2)
+
     return node_id, creds, interval
 
 def main():
