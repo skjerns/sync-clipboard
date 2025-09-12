@@ -23,3 +23,5 @@ then, start the application on two machines with different hostnames
 python sync-clip.py hostname
 ```
 
+
+<img width="188" height="191" alt="image" src="https://github.com/user-attachments/assets/e95df8aa-ae33-4f1f-be82-f369efd8cc05" />
