@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, time, json, hashlib, tempfile, glob, shutil, subprocess, atexit, base64
+import os, sys, time, json, hashlib, tempfile, glob, shutil, subprocess, atexit
 import socket
 
 # Optional Qt (PyQt5 preferred; fall back to PySide6)
@@ -163,7 +163,7 @@ class Settings:
         })
 
 class Clipboard:
-    """Clipboard access for text and images via wl-clipboard, xclip, or Tk(text-only)."""
+    """Clipboard access (text only). Filters out file-copy selections (KDE/GNOME)."""
     def __init__(self):
         self.mode = None
         self.tk = None
@@ -180,7 +180,28 @@ class Clipboard:
             except Exception:
                 self.mode = None
 
-    # ----- TEXT -----
+    def _list_types(self):
+        """Return a lowercase set of offered clipboard types."""
+        types = set()
+        try:
+            if self.mode == 'wl':
+                p = subprocess.run(['wl-paste', '--list-types'], capture_output=True, text=True)
+                if p.returncode == 0:
+                    for line in p.stdout.splitlines():
+                        t = line.strip().lower()
+                        if t:
+                            types.add(t)
+            elif self.mode == 'xclip':
+                p = subprocess.run(['xclip','-selection','clipboard','-t','TARGETS','-o'], capture_output=True, text=True)
+                if p.returncode == 0:
+                    for tok in p.stdout.split():
+                        t = tok.strip().lower()
+                        if t:
+                            types.add(t)
+        except Exception:
+            pass
+        return types
+
     def get_text(self):
         if self.mode == 'wl':
             try:
@@ -227,88 +248,56 @@ class Clipboard:
                 return False
         return False
 
-    # ----- IMAGES -----
-    def _list_types(self):
-        """Return a set of MIME types available for the current clipboard contents."""
-        types = set()
-        try:
-            if self.mode == 'wl':
-                p = subprocess.run(['wl-paste', '--list-types'], capture_output=True, text=True)
-                if p.returncode == 0:
-                    for line in p.stdout.splitlines():
-                        t = line.strip()
-                        if t: types.add(t)
-            elif self.mode == 'xclip':
-                p = subprocess.run(['xclip','-selection','clipboard','-t','TARGETS','-o'], capture_output=True, text=True)
-                if p.returncode == 0:
-                    for line in p.stdout.split():
-                        # xclip prints atoms; filter typical image types
-                        if line.startswith('image/'):
-                            types.add(line)
-        except Exception:
-            pass
-        return types
-
-    def get_image(self):
-        """Return (mime, bytes) if an image is present; else (None, b'')."""
-        types = self._list_types()
-        candidates = [t for t in ('image/png','image/jpeg','image/jpg') if t in types]
-        if not candidates:
-            return (None, b'')
-        mime = candidates[0]
-        try:
-            if self.mode == 'wl':
-                p = subprocess.run(['wl-paste','-t', mime], capture_output=True)
-                if p.returncode == 0:
-                    return (mime, p.stdout or b'')
-            elif self.mode == 'xclip':
-                p = subprocess.run(['xclip','-selection','clipboard','-t', mime, '-o'], capture_output=True)
-                if p.returncode == 0:
-                    return (mime, p.stdout or b'')
-        except Exception:
-            pass
-        return (None, b'')
-
-    def set_image(self, mime, data):
-        """Set image to clipboard; returns True on success."""
-        if mime not in ('image/png','image/jpeg','image/jpg'):
+    def _looks_like_file_copy_text(self, text):
+        """Heuristic for GNOME/KDE file-copy spillover when coerced to text/plain."""
+        if not text:
             return False
-        try:
-            if self.mode == 'wl':
-                p = subprocess.Popen(['wl-copy','-t', mime], stdin=subprocess.PIPE)
-                p.communicate(data)
-                return p.returncode == 0
-            elif self.mode == 'xclip':
-                p = subprocess.Popen(['xclip','-selection','clipboard','-t', mime, '-i'], stdin=subprocess.PIPE)
-                p.communicate(data)
-                return p.returncode == 0
-        except Exception:
-            return False
+        # GNOME: x-special/gnome-copied-files often coerces to "copy\nfile://..."
+        lines = text.splitlines()
+        if lines and lines[0] in ('copy', 'cut'):
+            for l in lines[1:]:
+                if l.startswith('file://'):
+                    return True
+        # Direct file:// URI list
+        if text.startswith('file://'):
+            return True
         return False
 
-    # ----- Unified payload API used by sync layer -----
     def get_payload(self):
-        """Return a dict describing current clipboard content (text or image)."""
-        mime, img = self.get_image()
-        if mime and img:
-            return {'format': 'image', 'mime': mime, 'data': img}
+        """Return a dict describing current clipboard content. Only text is eligible for sync."""
+        types = self._list_types()
+        # Block known file-copy selections and any non-text-only clipboards.
+        bad_types = {
+            'text/uri-list',
+            'x-special/gnome-copied-files',
+            'application/x-kde-cutselection',
+            'application/x-kde4-cutselection',
+            'application/x-kde4-clipboard-data',
+        }
+        if types & bad_types:
+            return {'format': 'none'}
+
+        # If any image type is present, skip.
+        if any(t.startswith('image/') for t in types):
+            return {'format': 'none'}
+
         text = self.get_text()
+        if not text:
+            return {'format': 'none'}
+
+        if self._looks_like_file_copy_text(text):
+            return {'format': 'none'}
+
+        # Prefer real plain text when types are known and include it.
+        if types and not any(t.startswith('text/') for t in types):
+            return {'format': 'none'}
+
         return {'format': 'text', 'text': text}
 
     def apply_payload(self, payload):
-        """Apply incoming payload to local clipboard."""
-        fmt = payload.get('format')
-        if fmt == 'image':
-            mime = payload.get('mime')
-            data_b64 = payload.get('data_b64')
-            if not mime or not data_b64:
-                return False
-            try:
-                buf = base64.b64decode(data_b64.encode('ascii'), validate=True)
-            except Exception:
-                return False
-            return self.set_image(mime, buf)
-        # default to text
+        """Apply incoming payload to local clipboard (text only)."""
+        if payload.get('format') != 'text':
+            return False
         text = payload.get('text', payload.get('content', ''))
         return self.set_text(text)
 
@@ -336,9 +325,9 @@ class Notifier:
         log(f'NOTICE {title}: {message}')
 
 class NcSync:
-    """Nextcloud WebDAV clipboard sync with per-node files (text + images)."""
+    """Nextcloud WebDAV clipboard sync (text-only)."""
     def __init__(self, url, user, app_password, remote_dir, node_id, cb, settings, notifier,
-                 interval=0.5, max_bytes=1_000_000, max_image_bytes=6_000_000):
+                 interval=0.5, max_bytes=1_000_000):
         self.url = url
         self.user = user
         self.app_password = app_password
@@ -349,7 +338,6 @@ class NcSync:
         self.notifier = notifier
         self.interval = interval
         self.max_bytes = max_bytes
-        self.max_image_bytes = max_image_bytes
 
         self.nc = None
         self.my_rel = f'{self.remote_dir}/{self.node_id}.clip.json'
@@ -370,7 +358,10 @@ class NcSync:
     def _snapshot_start_state(self):
         try:
             init = self.cb.get_payload()
-            self.last_local_hash = self._hash_payload(init)
+            if init.get('format') == 'text':
+                self.last_local_hash = self._hash_payload(init)
+            else:
+                self.last_local_hash = None
         except Exception:
             self.last_local_hash = None
         try:
@@ -423,22 +414,9 @@ class NcSync:
                 pass
 
     def _hash_payload(self, payload):
-        """Stable hash for change detection across text and images."""
-        fmt = payload.get('format')
-        if fmt == 'image':
-            mime = payload.get('mime','')
-            data = payload.get('data')
-            if isinstance(data, bytes):
-                raw = b'IMG\0' + mime.encode('utf-8','ignore') + b'\0' + data
-            else:
-                # when coming in via JSON pull
-                b64 = payload.get('data_b64','').encode('ascii', 'ignore')
-                try:
-                    raw = b'IMG\0' + mime.encode('utf-8','ignore') + b'\0' + base64.b64decode(b64, validate=False)
-                except Exception:
-                    raw = b'IMG\0' + mime.encode('utf-8','ignore') + b'\0'
-            return sha256_bytes(raw)
-        # text
+        """Stable hash for change detection for text payloads."""
+        if payload.get('format') != 'text':
+            return None
         text = payload.get('text', payload.get('content', ''))
         return sha256_text(text)
 
@@ -451,16 +429,17 @@ class NcSync:
             log(f'FOUND change in {name}')
             data = self._download_json(node, name)
             origin = data.get('origin', name.rsplit('.', 2)[0])
-            if origin == self.node_id:
-                log(f'SKIP own-origin from {name}')
-                self.peer_etags[name] = etag
-                continue
 
-            # Back-compat: old format had only text
+            # Back-compat: old format had only text in 'content'
             if 'format' not in data:
                 payload = {'format': 'text', 'text': data.get('content', '')}
             else:
                 payload = data
+
+            if payload.get('format') != 'text':
+                log('SKIP non-text payload from peer')
+                self.peer_etags[name] = etag
+                continue
 
             h = data.get('hash') or self._hash_payload(payload)
             if h and h == self.last_local_hash:
@@ -472,53 +451,33 @@ class NcSync:
             if applied:
                 self.last_local_hash = h
                 self.peer_etags[name] = etag
-                kind = payload.get('format')
-                if kind == 'image':
-                    size = len(payload.get('data_b64',''))
-                    log(f'APPLY image from {origin} (~{size*3//4} bytes)')
-                    self.notifier.notify('Clipboard received', f'Image from {origin}')
-                else:
-                    text = payload.get('text','')
-                    log(f'APPLY text from {origin} ({len(text)} chars)')
-                    self.notifier.notify('Clipboard received', f'From {origin}')
+                text = payload.get('text','')
+                log(f'APPLY text from {origin} ({len(text)} chars)')
+                self.notifier.notify('Clipboard received', f'From {origin}')
 
     def _push(self):
         try:
             payload = self.cb.get_payload()
-            fmt = payload.get('format')
+            if payload.get('format') != 'text':
+                return
 
-            if fmt == 'image':
-                mime = payload.get('mime')
-                data = payload.get('data') or b''
-                if not data or not mime:
-                    return
-                if len(data) > self.max_image_bytes:
-                    data = data[:self.max_image_bytes]
-                b64 = base64.b64encode(data).decode('ascii')
-                out = {
-                    'origin': self.node_id,
-                    'ts': int(time.time()),
-                    'format': 'image',
-                    'mime': mime,
-                    'data_b64': b64,
-                }
-            else:
-                text = payload.get('text') or ''
-                enc = text.encode('utf-8','ignore')
-                if len(enc) > self.max_bytes:
-                    enc = enc[:self.max_bytes]
-                    text = enc.decode('utf-8','ignore')
-                out = {
-                    'origin': self.node_id,
-                    'ts': int(time.time()),
-                    'format': 'text',
-                    'text': text
-                }
+            text = payload.get('text') or ''
+            enc = text.encode('utf-8','ignore')
+            if len(enc) > self.max_bytes:
+                enc = enc[:self.max_bytes]
+                text = enc.decode('utf-8','ignore')
 
-            h = self._hash_payload(payload if fmt == 'image' else {'format':'text','text':out['text']})
+            out = {
+                'origin': self.node_id,
+                'ts': int(time.time()),
+                'format': 'text',
+                'text': text
+            }
+
+            h = self._hash_payload({'format':'text','text':out['text']})
             if h != self.last_local_hash:
                 out['hash'] = h
-                log(f'SEND update ({fmt})')
+                log('SEND update (text)')
                 self._upload_atomic(self.my_rel, json.dumps(out, ensure_ascii=False))
                 self.last_local_hash = h
                 self.notifier.notify('Clipboard sent', 'Shared via Nextcloud')
@@ -543,8 +502,8 @@ class TrayApp:
 
         # Top label showing current host/node id
         host_text = f'Host: {self.ncsync.node_id}'
-        self.host_label = QtGui.QAction(host_text, self.menu)  # QAction comes from QtGui
-        self.host_label.setEnabled(False)  # label-like, non-interactive
+        self.host_label = QtGui.QAction(host_text, self.menu)
+        self.host_label.setEnabled(False)
         self.menu.addAction(self.host_label)
         self.menu.addSeparator()
 
@@ -567,7 +526,6 @@ class TrayApp:
         self.timer = QtCore.QTimer()
         self.timer.setInterval(int(self.ncsync.interval * 1000))
         self.timer.timeout.connect(self.ncsync.tick)
-
 
     def _icon(self):
         candidates = [
@@ -642,16 +600,23 @@ def load_creds_json(path):
     return {'url': url, 'user': user, 'app_password': app_password, 'remote_dir': remote_dir}
 
 def parse_args(argv):
-    """Usage: script [<node-id>] [--creds ./credentials.json] [--interval 0.5]"""
-    creds = './credentials.json'
+    """Usage: script [install | <node-id>] [--creds ./credentials.json] [--interval 0.5]"""
+    script_path = os.path.abspath(__file__)
+    script_dir = os.path.dirname(script_path)
+    creds = f'{script_dir}/credentials.json'
     interval = 0.5
     node_id = None
+    action = 'run'
     i = 1
 
     if i < len(argv) and not argv[i].startswith('-'):
-        node_id = argv[i]
+        if argv[i] == 'install':
+            action = 'install'
+        else:
+            node_id = argv[i]
         i += 1
-    else:
+    
+    if not node_id:
         node_id = socket.gethostname()
 
     while i < len(argv):
@@ -673,9 +638,41 @@ def parse_args(argv):
             print('Usage: clip_sync_nextcloud.py [<node-id>] [--creds ./credentials.json] [--interval 0.5]')
             sys.exit(2)
 
-    return node_id, creds, interval
+    return action, node_id, creds, interval
+
+def create_desktop_file():
+    """Creates a .desktop file for the application."""
+    script_path = os.path.abspath(__file__)
+    script_dir = os.path.dirname(script_path)
+    desktop_entry = f"""[Desktop Entry]
+Name=Sync Clipboard
+Comment=Syncs clipboard with a Nextcloud instance
+Exec=env DISPLAY=:0 python3 {script_path}
+Terminal=false
+Type=Application
+Icon=edit-paste
+Path={script_dir}
+"""
+    return desktop_entry
+
+def install():
+    """Installs the .desktop file."""
+    log('Creating .desktop file')
+    desktop_content = create_desktop_file()
+    app_dir = os.path.join(os.path.expanduser('~'), '.local', 'share', 'applications')
+    os.makedirs(app_dir, exist_ok=True)
+    desktop_file_path = os.path.join(app_dir, 'sync-clipboard.desktop')
+    with open(desktop_file_path, 'w') as f:
+        f.write(desktop_content)
+    log(f'Installed .desktop file to {desktop_file_path}')
 
 def main():
+    action, node_id, cred_path, interval = parse_args(sys.argv)
+
+    if action == 'install':
+        install()
+        sys.exit(0)
+
     token = acquire_single_instance()
     if not token:
         sys.exit(0)
@@ -685,7 +682,6 @@ def main():
         print('nc_py_api is not installed. Install with: python3 -m pip install --user nc_py_api')
         sys.exit(1)
 
-    node_id, cred_path, interval = parse_args(sys.argv)
     creds = load_creds_json(cred_path)
     missing = [k for k in ('url', 'user', 'app_password', 'remote_dir') if not creds.get(k)]
     if missing:
