@@ -14,6 +14,7 @@ BINDIR    := $(PREFIX)/bin
 APPSDIR   := $(PREFIX)/share/applications
 AUTOSTART := $(or $(XDG_CONFIG_HOME),$(HOME)/.config)/autostart
 LAUNCHER  := $(BINDIR)/clipsend
+ICONDIR   := $(PREFIX)/share/icons/hicolor/scalable/apps
 
 define DESKTOP
 [Desktop Entry]
@@ -22,7 +23,7 @@ Name=ClipSend
 GenericName=Clipboard sender
 Comment=Send the clipboard (text, images, files) to your other machines
 Exec=$(LAUNCHER)
-Icon=edit-paste
+Icon=clipsend
 Terminal=false
 StartupNotify=false
 Categories=Utility;
@@ -60,8 +61,9 @@ check:
 	@echo "dependencies OK"
 
 install: check
-	install -d $(APPDIR) $(BINDIR) $(APPSDIR) $(AUTOSTART)
+	install -d $(APPDIR) $(BINDIR) $(APPSDIR) $(AUTOSTART) $(ICONDIR)
 	install -m 644 clipsend.py $(APPDIR)/clipsend.py
+	install -m 644 clipsend.svg $(ICONDIR)/clipsend.svg
 	printf '#!/bin/sh\nexec "%s" "%s" "$$@"\n' "$(PYTHON)" "$(APPDIR)/clipsend.py" > $(LAUNCHER)
 	chmod 755 $(LAUNCHER)
 	echo "$$DESKTOP" > $(APPSDIR)/clipsend.desktop
@@ -72,7 +74,7 @@ install: check
 	@echo "Start it now with 'make start' (or 'make restart' if an old version is running)."
 
 uninstall: stop
-	rm -f $(LAUNCHER) $(APPSDIR)/clipsend.desktop $(AUTOSTART)/clipsend.desktop
+	rm -f $(LAUNCHER) $(APPSDIR)/clipsend.desktop $(AUTOSTART)/clipsend.desktop $(ICONDIR)/clipsend.svg
 	rm -rf $(APPDIR)
 	@echo "Removed. Settings are kept in ~/.config/clipsend (delete manually if wanted)."
 

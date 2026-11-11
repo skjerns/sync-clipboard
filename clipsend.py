@@ -1353,21 +1353,49 @@ class SettingsDialog(QtWidgets.QDialog):
 # --------------------------------------------------------------------------- #
 # tray application
 # --------------------------------------------------------------------------- #
-def app_icon(name=None):
-    for n in ([name] if name else []) + ['edit-paste', 'klipper', 'accessories-clipboard']:
-        if QtGui.QIcon.hasThemeIcon(n):
-            return QtGui.QIcon.fromTheme(n)
-    pm = QtGui.QPixmap(32, 32)
+# Own icon (a paper plane on a coloured tile) so it can't be confused with
+# Klipper's clipboard icon. The colour shows the state. Drawn with QPainter,
+# so no SVG plugin is needed; clipsend.svg is the same design for launchers.
+ICON_COLORS = {
+    'idle': ('#7b3fe4', '#00b4d8'),      # violet -> cyan
+    'busy': ('#ff6d00', '#ffb300'),      # orange (sending)
+    'recv': ('#00a86b', '#2ed3a0'),      # green (received)
+    'offline': ('#6b7280', '#9ca3af'),   # grey (not configured / offline)
+}
+_ICONS = {}
+
+
+def _paint_icon(size, c1, c2):
+    pm = QtGui.QPixmap(size, size)
     pm.fill(QtGui.QColor(0, 0, 0, 0))
     p = QtGui.QPainter(pm)
     p.setRenderHint(qenum(QtGui.QPainter, 'RenderHint', 'Antialiasing'))
-    p.setBrush(QtGui.QColor('#3daee9'))
+    p.scale(size / 64.0, size / 64.0)
+    grad = QtGui.QLinearGradient(0, 0, 64, 64)
+    grad.setColorAt(0, QtGui.QColor(c1))
+    grad.setColorAt(1, QtGui.QColor(c2))
     p.setPen(qenum(QtCore.Qt, 'PenStyle', 'NoPen'))
-    p.drawRoundedRect(6, 4, 20, 26, 3, 3)
-    p.setBrush(QtGui.QColor('#eff0f1'))
-    p.drawRect(11, 2, 10, 6)
+    p.setBrush(QtGui.QBrush(grad))
+    p.drawRoundedRect(QtCore.QRectF(2, 2, 60, 60), 15, 15)
+
+    def poly(*pts):
+        return QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in pts])
+    p.setBrush(QtGui.QColor('#ffffff'))              # paper plane
+    p.drawPolygon(poly((11, 31), (53, 12), (39, 53), (30, 38)))
+    p.setBrush(QtGui.QColor(0, 0, 0, 55))            # folded wing (shadow)
+    p.drawPolygon(poly((30, 38), (53, 12), (27, 47)))
     p.end()
-    return QtGui.QIcon(pm)
+    return pm
+
+
+def app_icon(state='idle'):
+    ic = _ICONS.get(state)
+    if ic is None:
+        ic = QtGui.QIcon()
+        for size in (16, 22, 24, 32, 48, 64, 128):
+            ic.addPixmap(_paint_icon(size, *ICON_COLORS[state]))
+        _ICONS[state] = ic
+    return ic
 
 
 class TrayApp(QtCore.QObject):
@@ -1380,10 +1408,11 @@ class TrayApp(QtCore.QObject):
         self.devices = []
         self.state = 'not configured'
         self.dialog = None
+        self._sending = False
 
-        self.icon_idle = app_icon()
-        self.icon_busy = app_icon('document-send')
-        self.icon_recv = app_icon('document-save')
+        self.icon_idle = app_icon('offline')
+        self.icon_busy = app_icon('busy')
+        self.icon_recv = app_icon('recv')
         self.tray = QtWidgets.QSystemTrayIcon(self.icon_idle, self)
         self.tray.activated.connect(self._activated)
 
@@ -1445,6 +1474,9 @@ class TrayApp(QtCore.QObject):
         self._update_tooltip()
 
     def _update_tooltip(self):
+        self.icon_idle = app_icon('idle' if self.state.startswith('connected') else 'offline')
+        if not self._sending:
+            self.tray.setIcon(self.icon_idle)
         tgt = 'all other devices' if self.cfg['target'] == '*' else self.cfg['target']
         tip = (f'ClipSend – {self.cfg["device_name"]} ({self.state})\n'
                f'Left-click: send clipboard to {tgt}')
@@ -1497,14 +1529,17 @@ class TrayApp(QtCore.QObject):
         if content['kind'] == 'none':
             self.notify('ClipSend', 'Clipboard is empty (or has an unsupported type).', error=True)
             return
+        self._sending = True
         self.tray.setIcon(self.icon_busy)
         self.engine.send_async(content, target or self.cfg['target'])
 
     def _on_sent(self, summary):
+        self._sending = False
         self.tray.setIcon(self.icon_idle)
         self.notify('Clipboard sent', clean_display(summary, 200))
 
     def _on_error(self, title, msg):
+        self._sending = False
         self.tray.setIcon(self.icon_idle)
         self.notify(title, msg, error=True)
 
@@ -1632,6 +1667,7 @@ def main():
     app.setApplicationName('ClipSend')
     app.setDesktopFileName('clipsend')
     app.setQuitOnLastWindowClosed(False)
+    app.setWindowIcon(app_icon())
     tray = TrayApp(app)
     tray.show_when_tray_ready()
     log.info('ClipSend %s started (Qt: %s, clipboard: %s)', VERSION, QT_API,
