@@ -2013,11 +2013,13 @@ def main():
         print(f'installed to {INSTALL_DIR} and started: {quote_argv(argv)}')
         return 0
     if getattr(args, 'uninstall', False):
+        # create the GUI app first: send_command() would otherwise create a QCoreApplication,
+        # and a second (GUI) application object cannot be created in the same process
+        app = QtWidgets.QApplication(sys.argv) if FROZEN else None
         win_uninstall()
         msg = 'ClipSend was removed. Your settings in %APPDATA%\\ClipSend were kept.'
         print(msg)
         if FROZEN:      # started from "Installed apps": no console to print to
-            app = QtWidgets.QApplication(sys.argv)
             box = QtWidgets.QMessageBox(qenum(QtWidgets.QMessageBox, 'Icon', 'Information'), 'ClipSend', msg)
             QtCore.QTimer.singleShot(15000, box.accept)
             qexec(box)
