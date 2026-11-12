@@ -158,11 +158,15 @@ DEFAULTS = {
     'use_push': True,
     'poll_interval': 0.5,
     'passphrase': '',
-    'notifications': True,
+    'notify_sent': True,          # popup after sending
+    'notify_received': True,      # popup after receiving (errors are always shown)
 }
 
 
 def _coerce(cfg):
+    cfg = dict(cfg)
+    for k in ('notify_sent', 'notify_received'):      # migrate the old single switch
+        cfg.setdefault(k, cfg.get('notifications', True))
     out = dict(DEFAULTS)
     for k, default in DEFAULTS.items():
         v = cfg.get(k, default)
@@ -1129,9 +1133,9 @@ class ControlServer(QtCore.QObject):
                     conn.settimeout(2)
                     cmd = conn.recv(64).decode('ascii', 'ignore').strip()
                     if cmd in COMMANDS:
+                        conn.sendall(b'ok\n')       # reply first: 'quit' may end the process
                         if cmd != 'ping':
                             self.command.emit(cmd)
-                        conn.sendall(b'ok\n')
                     else:
                         conn.sendall(b'unknown command\n')
                 except OSError:
@@ -1147,6 +1151,18 @@ def send_command(cmd):
             return s.recv(64).decode().strip() == 'ok'
     except OSError:
         return False
+
+
+def wait_for_exit(timeout=15.0):
+    """After 'quit': wait until the instance released its lock (X11 clipboard hand-over can take a while)."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        fd = acquire_lock()
+        if fd is not None:
+            os.close(fd)
+            return True
+        time.sleep(0.2)
+    return False
 
 
 def acquire_lock():
@@ -1257,7 +1273,7 @@ class SettingsDialog(QtWidgets.QDialog):
         f.addRow('Discard items older than', self.age)
         lay.addWidget(g)
 
-        # security & misc
+        # security
         g = W.QGroupBox('Security')
         f = W.QFormLayout(g)
         self.pp = W.QLineEdit(cfg['passphrase'])
@@ -1265,10 +1281,18 @@ class SettingsDialog(QtWidgets.QDialog):
         self.pp.setPlaceholderText('empty = no end-to-end encryption')
         self.pp.setToolTip('Same passphrase on all devices. Content is encrypted (AES-GCM) before upload, '
                            'and anything not encrypted with it is rejected.')
-        self.notif = W.QCheckBox('Show notifications for sent / received items')
-        self.notif.setChecked(cfg['notifications'])
+        self.notif_sent = W.QCheckBox('Show a popup when something was sent')
+        self.notif_sent.setChecked(cfg['notify_sent'])
+        self.notif_recv = W.QCheckBox('Show a popup when something was received')
+        self.notif_recv.setChecked(cfg['notify_received'])
+        self.notif_recv.setToolTip('Errors and rejected items are always shown.')
         f.addRow('Shared passphrase', self.pp)
-        f.addRow(self.notif)
+        lay.addWidget(g)
+
+        g = W.QGroupBox('Notifications')
+        f = W.QFormLayout(g)
+        f.addRow(self.notif_sent)
+        f.addRow(self.notif_recv)
         lay.addWidget(g)
 
         bb = W.QDialogButtonBox(qenum(W.QDialogButtonBox, 'StandardButton', 'Save')
@@ -1292,7 +1316,8 @@ class SettingsDialog(QtWidgets.QDialog):
                  download_dir=os.path.expanduser(self.ddir.text().strip()) or DEFAULTS['download_dir'],
                  use_push=self.push.isChecked(), poll_interval=self.poll.value(),
                  max_age_min=self.age.value(), passphrase=self.pp.text(),
-                 notifications=self.notif.isChecked())
+                 notify_sent=self.notif_sent.isChecked(),
+                 notify_received=self.notif_recv.isChecked())
         text = self.target.currentText().strip()
         idx = self.target.findText(text)
         c['target'] = self.target.itemData(idx) if idx >= 0 else text
@@ -1536,7 +1561,7 @@ class TrayApp(QtCore.QObject):
     def _on_sent(self, summary):
         self._sending = False
         self.tray.setIcon(self.icon_idle)
-        self.notify('Clipboard sent', clean_display(summary, 200))
+        self.notify('Clipboard sent', clean_display(summary, 200), kind='sent')
 
     def _on_error(self, title, msg):
         self._sending = False
@@ -1566,7 +1591,7 @@ class TrayApp(QtCore.QObject):
             return
         self.tray.setIcon(self.icon_recv)
         QtCore.QTimer.singleShot(2500, lambda: self.tray.setIcon(self.icon_idle))
-        self.notify('Clipboard received', body)
+        self.notify('Clipboard received', body, kind='received')
 
     def _toggle_recv(self, on):
         self.cfg['receive_enabled'] = bool(on)
@@ -1594,8 +1619,8 @@ class TrayApp(QtCore.QObject):
             self.dialog.deleteLater()
             self.dialog = None
 
-    def notify(self, title, body, error=False):
-        if not error and not self.cfg['notifications']:
+    def notify(self, title, body, error=False, kind=None):
+        if not error and kind and not self.cfg.get(f'notify_{kind}', True):
             return
         log.info('%s: %s', title, html.unescape(body))
         if not self.tray.isVisible():
@@ -1653,6 +1678,9 @@ def main():
     for cmd in ('send', 'settings', 'quit'):
         if getattr(args, cmd):
             if send_command(cmd):
+                if cmd == 'quit' and not wait_for_exit():
+                    print('ClipSend did not exit within 15 s.', file=sys.stderr)
+                    return 1
                 return 0
             print('ClipSend is not running.', file=sys.stderr)
             return 1

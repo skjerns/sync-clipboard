@@ -85,7 +85,6 @@ stop:
 	@-$(LAUNCHER) --quit 2>/dev/null && echo "stopped" || true
 
 restart: stop
-	@sleep 1
 	@$(MAKE) --no-print-directory start
 
 log:

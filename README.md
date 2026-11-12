@@ -48,7 +48,7 @@ Open them with right-click → Settings…; they're stored in `~/.config/clipsen
 * receive on/off, put received items into the clipboard, download folder
 * instant push on/off, poll interval (default 0.5 s), discard items older than N minutes
 * **shared passphrase** for end-to-end encryption
-* notifications on/off
+* popups for sent and for received items, switchable independently (errors are always shown)
 
 ## How it works
 
