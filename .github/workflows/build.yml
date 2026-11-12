@@ -33,6 +33,7 @@ jobs:
   windows-exe:
     needs: test
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -53,7 +54,11 @@ jobs:
           $exe = Resolve-Path dist\ClipSend.exe
           $log = "$env:LOCALAPPDATA\ClipSend\clipsend.log"
           function Run($file, $arg) {
-            $p = Start-Process $file -ArgumentList $arg -Wait -PassThru
+            # not -Wait: that also waits for child processes (--install starts the installed copy)
+            Write-Host "> $file $arg"
+            $p = Start-Process $file -ArgumentList $arg -PassThru
+            $null = $p.Handle                     # needed for ExitCode to be populated
+            if (-not $p.WaitForExit(120000)) { $p.Kill(); throw "$file $arg timed out" }
             if ($p.ExitCode -ne 0) { if (Test-Path $log) { Get-Content $log }; throw "$file $arg -> exit $($p.ExitCode)" }
           }
           # portable start (skip the install question), then quit via the control pipe
