@@ -1,6 +1,7 @@
 """Offline tests for ClipSend (no server needed). Run: pytest tests/"""
 import base64
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -164,16 +165,22 @@ def test_control_channel(qapp, tmp_path, monkeypatch):
     server.command.connect(got.append)
     server.start()
     try:
-        result = {}
-        t = threading.Thread(target=lambda: result.update(ok=cs.send_command('send'),
-                                                          bad=cs.send_command('rm -rf')))
-        t.start()
-        end = time.time() + 10
-        while (t.is_alive() or not got) and time.time() < end:
+        # the client side runs as a separate process, exactly like `clipsend --send`
+        script = os.path.join(os.path.dirname(__file__), '..', 'clipsend.py')
+        proc = subprocess.Popen([sys.executable, script, '--send'])
+        end = time.time() + 30
+        while (proc.poll() is None or not got) and time.time() < end:
             qapp.processEvents()
             time.sleep(0.02)
-        assert result == {'ok': True, 'bad': False}
+        assert proc.returncode == 0
         assert got == ['send']
+        result = {}
+        t = threading.Thread(target=lambda: result.update(bad=cs.send_command('rm -rf')))
+        t.start()
+        while t.is_alive() and time.time() < end:
+            qapp.processEvents()
+            time.sleep(0.02)
+        assert result == {'bad': False} and got == ['send']
     finally:
         server.close()
 

@@ -563,7 +563,8 @@ def collect_files(paths, max_bytes):
                     if os.path.islink(fp) or not os.path.isfile(fp):
                         skipped += 1
                         continue
-                    add(fp, os.path.join(name, os.path.relpath(fp, p)))
+                    # always '/' on the wire (Windows would use '\\', which receivers reject)
+                    add(fp, '/'.join([name] + os.path.relpath(fp, p).split(os.sep)))
         else:
             skipped += 1
     if not entries:
@@ -1202,10 +1203,16 @@ class WinControlServer(QtCore.QObject):
         while self.server.hasPendingConnections():
             conn = self.server.nextPendingConnection()
             conn.readyRead.connect(lambda c=conn: self._read(c))
-            QtCore.QTimer.singleShot(3000, conn.abort)
+            conn.disconnected.connect(conn.deleteLater)
+            if conn.bytesAvailable():       # data may have arrived before readyRead was connected
+                self._read(conn)
 
     def _read(self, conn):
-        cmd = bytes(conn.readAll())[:64].decode('ascii', 'ignore').strip()
+        if not conn.canReadLine():
+            if conn.bytesAvailable() > 64:
+                conn.abort()
+            return
+        cmd = bytes(conn.readLine(64)).decode('ascii', 'ignore').strip()
         conn.write(b'ok\n' if cmd in COMMANDS else b'unknown command\n')
         conn.flush()
         if cmd in COMMANDS and cmd != 'ping':
@@ -1367,7 +1374,7 @@ def get_autostart():
 
 
 def set_autostart(on):
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
         if on:
             winreg.SetValueEx(k, 'ClipSend', 0, winreg.REG_SZ, autostart_command())
         else:
