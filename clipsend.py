@@ -5,7 +5,9 @@ using a Nextcloud account as relay.
 
   * Left-click the tray icon  -> send the current clipboard
   * Right-click               -> menu (send to..., settings, ...)
-  * `clipsend --send`         -> same as left click (bind it to a KDE shortcut)
+  * `clipsend --send`         -> same as left click (bind it to a keyboard shortcut)
+
+Runs on Linux (KDE Plasma, X11 or Wayland) and Windows 10/11.
 
 Transport: every device has an inbox folder on Nextcloud
 (<remote_dir>/inbox/<device>/).  Sending = one WebDAV PUT into the inbox of
@@ -17,7 +19,6 @@ connection per interval).
 import argparse
 import base64
 import errno
-import fcntl
 import html
 import json
 import logging
@@ -38,19 +39,33 @@ import uuid
 import xml.etree.ElementTree as ET
 import zlib
 
+WINDOWS = sys.platform == 'win32'
+if WINDOWS:
+    import msvcrt
+    import winreg
+else:
+    import fcntl
+
 APP = 'clipsend'
 VERSION = '2.0'
 
 # --------------------------------------------------------------------------- #
 # paths
 # --------------------------------------------------------------------------- #
-CONFIG_DIR = os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'), APP)
+if WINDOWS:
+    CONFIG_DIR = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'ClipSend')
+    CACHE_DIR = os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'), 'ClipSend')
+else:
+    CONFIG_DIR = os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'), APP)
+    CACHE_DIR = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'), APP)
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.json')
-CACHE_DIR = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'), APP)
 LOG_FILE = os.path.join(CACHE_DIR, 'clipsend.log')
 
 
 def runtime_dir():
+    if WINDOWS:     # %LOCALAPPDATA% is private to the user by ACL
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        return CACHE_DIR
     d = os.environ.get('XDG_RUNTIME_DIR')
     if d and os.path.isdir(d) and os.access(d, os.W_OK):
         return d
@@ -126,12 +141,12 @@ def human_size(n):
 
 
 def clean_display(s, maxlen=120):
-    """Make untrusted text safe for a (rich-text) notification."""
+    """Make untrusted text safe for a notification (KDE renders markup, Windows plain text)."""
     s = _BAD_CHARS.sub(' ', str(s))
     s = re.sub(r'\s+', ' ', s).strip()
     if len(s) > maxlen:
         s = s[:maxlen - 1] + '…'
-    return html.escape(s)
+    return s if WINDOWS else html.escape(s)
 
 
 def sanitize_device(name):
@@ -160,6 +175,7 @@ DEFAULTS = {
     'passphrase': '',
     'notify_sent': True,          # popup after sending
     'notify_received': True,      # popup after receiving (errors are always shown)
+    'offer_install': True,        # Windows exe: ask once to install for this user
 }
 
 
@@ -194,7 +210,7 @@ def _coerce(cfg):
 def load_config():
     try:
         st = os.stat(CONFIG_FILE)
-        if st.st_mode & 0o077:
+        if not WINDOWS and st.st_mode & 0o077:
             os.chmod(CONFIG_FILE, 0o600)
         with open(CONFIG_FILE, encoding='utf-8') as f:
             data = json.load(f)
@@ -429,9 +445,22 @@ def validate_message(msg, max_bytes, me):
     return out
 
 
+_WIN_RESERVED = re.compile(r'^(con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]|lpt[0-9¹²³])(\..*)?$', re.I)
+
+
+def win_safe_component(part):
+    """Windows: no ':' (alternate data streams), no reserved device names, no trailing dots/spaces."""
+    part = re.sub(r'[<>:"|?*]', '_', part).rstrip(' .')
+    if _WIN_RESERVED.match(part):
+        part = '_' + part
+    return part
+
+
 def safe_component(part):
     part = unicodedata.normalize('NFC', _BAD_CHARS.sub('', part)).strip()
     part = part.replace('/', '_').replace('\\', '_')
+    if WINDOWS:
+        part = win_safe_component(part)
     if part in ('', '.', '..'):
         raise Rejected('unsafe path in file list')
     while len(part.encode('utf-8')) > 200:
@@ -446,6 +475,20 @@ def safe_relpath(path):
     if not parts or len(parts) > 32:
         raise Rejected('unsafe path in file list')
     return [safe_component(p) for p in parts]
+
+
+_O_NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
+_O_BINARY = getattr(os, 'O_BINARY', 0)       # Windows: otherwise os.open() is in text mode
+
+
+def mark_of_the_web(path):
+    """Tag a received file as 'downloaded from the internet' so Windows (SmartScreen,
+    Office Protected View) warns before opening or running it."""
+    try:
+        with open(path + ':Zone.Identifier', 'w') as z:
+            z.write('[ZoneTransfer]\r\nZoneId=3\r\n')
+    except OSError:
+        pass        # e.g. FAT drives have no alternate data streams
 
 
 def write_received_files(files, download_dir, sender):
@@ -470,13 +513,13 @@ def write_received_files(files, download_dir, sender):
             raise Rejected('path escapes destination')
         parent = os.path.dirname(target)
         os.makedirs(parent, mode=0o755, exist_ok=True)
-        if os.path.realpath(parent) != os.path.abspath(parent):
+        if os.path.normcase(os.path.realpath(parent)) != os.path.normcase(os.path.abspath(parent)):
             raise Rejected('symlink in destination path')
         stem, ext = os.path.splitext(parts[-1])
         for n in range(1, 1000):
             try:
                 # O_EXCL + O_NOFOLLOW: never overwrite or follow anything; 0o644: never executable
-                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_BINARY, 0o644)
                 break
             except FileExistsError:
                 target = os.path.join(parent, f'{stem} ({n + 1}){ext}')
@@ -484,6 +527,8 @@ def write_received_files(files, download_dir, sender):
             raise OSError('too many name collisions')
         with os.fdopen(fd, 'wb') as fh:
             fh.write(data)
+        if WINDOWS:
+            mark_of_the_web(target)
         total += len(data)
         first = os.path.join(dest, parts[0]) if len(parts) > 1 else target
         if first not in top:
@@ -736,8 +781,42 @@ class Clipboard:
             return self.get('text/plain', cap).decode('utf-8', 'replace')
         return ''
 
+    def _read_qt(self, max_bytes):
+        md = QtGui.QGuiApplication.clipboard().mimeData()
+        if md is None:
+            return {'kind': 'none'}
+        if md.hasUrls():
+            urls = list(md.urls())
+            if urls and all(u.isLocalFile() for u in urls):
+                paths = [u.toLocalFile() for u in urls]
+                if all(os.path.exists(p) for p in paths):
+                    return {'kind': 'files', 'paths': paths}
+        formats = list(md.formats())
+        images = [t for t in formats if t.lower() in IMAGE_MAGIC]
+        if images:
+            mime = 'image/png' if 'image/png' in images else images[0]
+            data = self.get(mime, max_bytes)
+            if data:
+                return {'kind': 'image', 'mime': mime.lower(), 'data': data}
+        if md.hasImage():           # e.g. Windows screenshots (CF_DIB): convert to PNG
+            img = md.imageData()
+            if isinstance(img, QtGui.QImage) and not img.isNull():
+                buf = QtCore.QBuffer()
+                buf.open(qenum(QtCore.QIODevice, 'OpenModeFlag', 'WriteOnly'))
+                img.save(buf, 'PNG')
+                data = bytes(buf.data())
+                if len(data) > max_bytes:
+                    raise Rejected(f'image is larger than the limit ({human_size(max_bytes)})')
+                return {'kind': 'image', 'mime': 'image/png', 'data': data}
+        text = self.get_text(formats, max_bytes)
+        if text:
+            return {'kind': 'text', 'text': text}
+        return {'kind': 'none'}
+
     def read(self, max_bytes):
         """Return a content dict describing the clipboard."""
+        if not self.wl:
+            return self._read_qt(max_bytes)
         types = self.types()
         tl = [t.lower() for t in types]
         if 'text/uri-list' in tl:
@@ -1100,6 +1179,58 @@ def sock_path():
     return os.path.join(runtime_dir(), f'{APP}.sock')
 
 
+def pipe_name():
+    import getpass
+    return 'clipsend-' + re.sub(r'[^A-Za-z0-9_.-]', '_', getpass.getuser())
+
+
+class WinControlServer(QtCore.QObject):
+    """Windows: named pipe via QLocalServer, restricted to the current user."""
+    command = Signal(str)
+
+    def start(self):
+        from importlib import import_module
+        QtNetwork = import_module(f'{QT_API}.QtNetwork')
+        self.server = QtNetwork.QLocalServer(self)
+        self.server.setSocketOptions(qenum(QtNetwork.QLocalServer, 'SocketOption', 'UserAccessOption'))
+        QtNetwork.QLocalServer.removeServer(pipe_name())
+        if not self.server.listen(pipe_name()):
+            raise OSError(f'cannot listen on control pipe: {self.server.errorString()}')
+        self.server.newConnection.connect(self._new_connection)
+
+    def _new_connection(self):
+        while self.server.hasPendingConnections():
+            conn = self.server.nextPendingConnection()
+            conn.readyRead.connect(lambda c=conn: self._read(c))
+            QtCore.QTimer.singleShot(3000, conn.abort)
+
+    def _read(self, conn):
+        cmd = bytes(conn.readAll())[:64].decode('ascii', 'ignore').strip()
+        conn.write(b'ok\n' if cmd in COMMANDS else b'unknown command\n')
+        conn.flush()
+        if cmd in COMMANDS and cmd != 'ping':
+            QtCore.QTimer.singleShot(50, lambda: self.command.emit(cmd))
+
+    def close(self):
+        self.server.close()
+
+
+def win_send_command(cmd):
+    from importlib import import_module
+    QtNetwork = import_module(f'{QT_API}.QtNetwork')
+    if QtCore.QCoreApplication.instance() is None:
+        win_send_command._app = QtCore.QCoreApplication([])
+    s = QtNetwork.QLocalSocket()
+    s.connectToServer(pipe_name())
+    if not s.waitForConnected(2000):
+        return False
+    s.write(cmd.encode() + b'\n')
+    s.waitForBytesWritten(1000)
+    if not s.waitForReadyRead(3000):
+        return False
+    return bytes(s.readAll()).strip() == b'ok'
+
+
 class ControlServer(QtCore.QObject):
     command = Signal(str)
 
@@ -1141,8 +1272,17 @@ class ControlServer(QtCore.QObject):
                 except OSError:
                     pass
 
+    def close(self):
+        self.sock.close()
+        try:
+            os.unlink(sock_path())
+        except OSError:
+            pass
+
 
 def send_command(cmd):
+    if WINDOWS:
+        return win_send_command(cmd)
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(3)
@@ -1168,6 +1308,13 @@ def wait_for_exit(timeout=15.0):
 def acquire_lock():
     path = os.path.join(runtime_dir(), f'{APP}.lock')
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    if WINDOWS:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            os.close(fd)
+            return None
+        return fd
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as e:
@@ -1176,6 +1323,165 @@ def acquire_lock():
             return None
         raise
     return fd
+
+
+# --------------------------------------------------------------------------- #
+# Windows autostart (HKCU Run key; Linux uses the .desktop file from `make install`)
+# --------------------------------------------------------------------------- #
+RUN_KEY = r'Software\Microsoft\Windows\CurrentVersion\Run'
+
+
+FROZEN = getattr(sys, 'frozen', False)          # PyInstaller exe
+INSTALL_DIR = os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'), 'Programs', 'ClipSend')
+UNINSTALL_KEY = r'Software\Microsoft\Windows\CurrentVersion\Uninstall\ClipSend'
+
+
+def pythonw():
+    pyw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')   # no console window
+    return pyw if os.path.exists(pyw) else sys.executable
+
+
+def launch_argv(installed=False):
+    """Command line that starts ClipSend (the installed copy if installed=True)."""
+    if FROZEN:
+        return [os.path.join(INSTALL_DIR, 'ClipSend.exe') if installed else sys.executable]
+    script = os.path.join(INSTALL_DIR, 'clipsend.py') if installed else os.path.abspath(__file__)
+    return [pythonw(), script]
+
+
+def quote_argv(argv):
+    return ' '.join(f'"{a}"' for a in argv)
+
+
+def autostart_command():
+    installed = os.path.exists(launch_argv(installed=True)[-1])
+    return quote_argv(launch_argv(installed=installed))
+
+
+def get_autostart():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            return bool(winreg.QueryValueEx(k, 'ClipSend')[0])
+    except OSError:
+        return False
+
+
+def set_autostart(on):
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        if on:
+            winreg.SetValueEx(k, 'ClipSend', 0, winreg.REG_SZ, autostart_command())
+        else:
+            try:
+                winreg.DeleteValue(k, 'ClipSend')
+            except FileNotFoundError:
+                pass
+
+
+def is_installed_copy():
+    here = sys.executable if FROZEN else os.path.abspath(__file__)
+    return os.path.normcase(os.path.dirname(os.path.abspath(here))) == os.path.normcase(INSTALL_DIR)
+
+
+def _shortcut(lnk, argv, icon):
+    """Create a .lnk via the WScript.Shell COM object (values passed via env, no quoting issues)."""
+    ps = ('$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:CS_LNK); '
+          '$s.TargetPath = $env:CS_TARGET; $s.Arguments = $env:CS_ARGS; '
+          '$s.IconLocation = $env:CS_ICON; $s.Description = "Send your clipboard to your other machines"; '
+          '$s.Save()')
+    env = dict(os.environ, CS_LNK=lnk, CS_TARGET=argv[0], CS_ARGS=quote_argv(argv[1:]), CS_ICON=icon)
+    subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps], env=env, check=True,
+                   creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0), timeout=60)
+
+
+def start_menu_lnk():
+    return os.path.join(os.environ.get('APPDATA', ''), 'Microsoft', 'Windows', 'Start Menu',
+                        'Programs', 'ClipSend.lnk')
+
+
+def win_install(start=True):
+    """Per-user install: copy to %LOCALAPPDATA%\\Programs\\ClipSend, Start Menu entry,
+    autostart, entry in 'Installed apps'. No admin rights needed."""
+    if send_command('quit'):          # running copy would lock the files
+        wait_for_exit()
+    os.makedirs(INSTALL_DIR, exist_ok=True)
+    if FROZEN:
+        src_files = {sys.executable: 'ClipSend.exe'}
+    else:
+        here = os.path.dirname(os.path.abspath(__file__))
+        src_files = {os.path.abspath(__file__): 'clipsend.py'}
+        if os.path.exists(os.path.join(here, 'clipsend.ico')):
+            src_files[os.path.join(here, 'clipsend.ico')] = 'clipsend.ico'
+    for src, name in src_files.items():
+        dst = os.path.join(INSTALL_DIR, name)
+        if os.path.normcase(os.path.abspath(src)) != os.path.normcase(dst):
+            shutil.copy2(src, dst)
+    argv = launch_argv(installed=True)
+    icon = argv[0] if FROZEN else os.path.join(INSTALL_DIR, 'clipsend.ico')
+    set_autostart(True)
+    _shortcut(start_menu_lnk(), argv, icon)
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY) as k:
+        for name, value in (('DisplayName', 'ClipSend'), ('DisplayVersion', VERSION),
+                            ('DisplayIcon', icon), ('InstallLocation', INSTALL_DIR),
+                            ('UninstallString', quote_argv(argv) + ' --uninstall')):
+            winreg.SetValueEx(k, name, 0, winreg.REG_SZ, value)
+        winreg.SetValueEx(k, 'NoModify', 0, winreg.REG_DWORD, 1)
+        winreg.SetValueEx(k, 'NoRepair', 0, winreg.REG_DWORD, 1)
+    if start:
+        subprocess.Popen(argv, close_fds=True, creationflags=getattr(subprocess, 'DETACHED_PROCESS', 0))
+    return argv
+
+
+def win_uninstall():
+    """Undo win_install(). Settings in %APPDATA%\\ClipSend and received files are kept."""
+    if send_command('quit'):
+        wait_for_exit()
+    set_autostart(False)
+    for path in (start_menu_lnk(),):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY)
+    except FileNotFoundError:
+        pass
+    if os.path.isdir(INSTALL_DIR):
+        if is_installed_copy():       # cannot delete ourselves while running: retry until we exited
+            ps = ('for ($i = 0; $i -lt 120 -and (Test-Path -LiteralPath $env:CS_DIR); $i++) '
+                  '{ Start-Sleep 1; Remove-Item -LiteralPath $env:CS_DIR -Recurse -Force -EA SilentlyContinue }')
+            subprocess.Popen(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
+                             env=dict(os.environ, CS_DIR=INSTALL_DIR), close_fds=True,
+                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        else:
+            shutil.rmtree(INSTALL_DIR, ignore_errors=True)
+
+
+def offer_install(app):
+    """Windows exe started from e.g. Downloads: offer a per-user install once."""
+    cfg = load_config()
+    if not (WINDOWS and FROZEN and cfg['offer_install']) or is_installed_copy():
+        return False
+    W = QtWidgets.QMessageBox
+    box = W(qenum(W, 'Icon', 'Question'), 'Install ClipSend',
+            'Install ClipSend for this user?\n\n'
+            f'It will be copied to {INSTALL_DIR}, added to the Start Menu and started '
+            'automatically when you log in. No administrator rights are needed.\n\n'
+            'Choose "No" to just run it from here this time.')
+    box.setWindowIcon(app_icon())
+    yes = box.addButton('Install', qenum(W, 'ButtonRole', 'AcceptRole'))
+    box.addButton('No', qenum(W, 'ButtonRole', 'RejectRole'))
+    never = box.addButton("Don't ask again", qenum(W, 'ButtonRole', 'DestructiveRole'))
+    qexec(box)
+    if box.clickedButton() is yes:
+        try:
+            win_install(start=True)
+            return True
+        except Exception as e:
+            W.warning(None, 'ClipSend', f'Installation failed:\n{e}')
+    elif box.clickedButton() is never:
+        cfg['offer_install'] = False
+        save_config(cfg)
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -1295,6 +1601,12 @@ class SettingsDialog(QtWidgets.QDialog):
         f.addRow(self.notif_recv)
         lay.addWidget(g)
 
+        self.autostart = None
+        if WINDOWS:
+            self.autostart = W.QCheckBox('Start ClipSend when I log in to Windows')
+            self.autostart.setChecked(get_autostart())
+            lay.addWidget(self.autostart)
+
         bb = W.QDialogButtonBox(qenum(W.QDialogButtonBox, 'StandardButton', 'Save')
                                 | qenum(W.QDialogButtonBox, 'StandardButton', 'Cancel'))
         bb.accepted.connect(self._save)
@@ -1371,6 +1683,11 @@ class SettingsDialog(QtWidgets.QDialog):
         if err:
             QtWidgets.QMessageBox.warning(self, 'ClipSend', err)
             return
+        if self.autostart is not None and self.autostart.isChecked() != get_autostart():
+            try:
+                set_autostart(self.autostart.isChecked())
+            except OSError as e:
+                QtWidgets.QMessageBox.warning(self, 'ClipSend', f'Could not change autostart:\n{e}')
         self.cfg = _coerce(c)
         self.accept()
 
@@ -1459,7 +1776,7 @@ class TrayApp(QtCore.QObject):
         self.menu.aboutToShow.connect(self._update_menu)
         self.tray.setContextMenu(self.menu)
 
-        self.ctl = ControlServer()
+        self.ctl = WinControlServer() if WINDOWS else ControlServer()
         self.ctl.command.connect(self._command)
         self.ctl.start()
 
@@ -1640,8 +1957,7 @@ class TrayApp(QtCore.QObject):
         if self.engine:
             self.engine.stop()
         try:
-            self.ctl.sock.close()
-            os.unlink(sock_path())
+            self.ctl.close()
         except OSError:
             pass
         self.app.quit()
@@ -1655,10 +1971,11 @@ def setup_logging(verbose):
     fmt = logging.Formatter('%(asctime)s %(levelname)s %(message)s', '%Y-%m-%d %H:%M:%S')
     fh = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=1 << 20, backupCount=2)
     fh.setFormatter(fmt)
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
     log.addHandler(fh)
-    log.addHandler(sh)
+    if sys.stderr is not None:          # pythonw / windowed exe have no console
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        log.addHandler(sh)
     log.setLevel(logging.DEBUG if verbose else logging.INFO)
 
 
@@ -1669,11 +1986,35 @@ def main():
     g.add_argument('--settings', action='store_true', help='open the settings of the running instance')
     g.add_argument('--quit', action='store_true', help='quit the running instance')
     g.add_argument('--import-legacy', metavar='JSON', help='import credentials.json of the old sync-clip.py')
+    if WINDOWS:
+        g.add_argument('--autostart', choices=('on', 'off'), help='start ClipSend at Windows login')
+        g.add_argument('--install', action='store_true',
+                       help='install for this user (Start Menu, autostart, Installed apps) and start it')
+        g.add_argument('--uninstall', action='store_true', help='remove the per-user installation')
     ap.add_argument('-v', '--verbose', action='store_true')
     args = ap.parse_args()
 
     if args.import_legacy:
         import_legacy(args.import_legacy)
+        return 0
+    if getattr(args, 'autostart', None):
+        set_autostart(args.autostart == 'on')
+        print(f'autostart {args.autostart}')
+        return 0
+    if getattr(args, 'install', False):
+        argv = win_install(start=True)
+        print(f'installed to {INSTALL_DIR} and started: {quote_argv(argv)}')
+        return 0
+    if getattr(args, 'uninstall', False):
+        win_uninstall()
+        msg = 'ClipSend was removed. Your settings in %APPDATA%\\ClipSend were kept.'
+        print(msg)
+        if FROZEN:      # started from "Installed apps": no console to print to
+            app = QtWidgets.QApplication(sys.argv)
+            box = QtWidgets.QMessageBox(qenum(QtWidgets.QMessageBox, 'Icon', 'Information'), 'ClipSend', msg)
+            QtCore.QTimer.singleShot(15000, box.accept)
+            qexec(box)
+            del app
         return 0
     for cmd in ('send', 'settings', 'quit'):
         if getattr(args, cmd):
@@ -1686,16 +2027,27 @@ def main():
             return 1
 
     setup_logging(args.verbose)
-    lock = acquire_lock()
-    if lock is None:
-        print('ClipSend is already running (use --settings / --send / --quit).', file=sys.stderr)
-        return 0
-
+    if WINDOWS:     # own taskbar/notification identity instead of "Python"
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('ClipSend')
+        except Exception:
+            pass
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName('ClipSend')
     app.setDesktopFileName('clipsend')
     app.setQuitOnLastWindowClosed(False)
     app.setWindowIcon(app_icon())
+    # before taking the lock: installing (or upgrading) starts the installed copy instead
+    if offer_install(app):
+        return 0
+
+    lock = acquire_lock()
+    if lock is None:
+        print('ClipSend is already running (use --settings / --send / --quit).', file=sys.stderr)
+        if WINDOWS:     # double-clicked again: show something instead of silently exiting
+            send_command('settings')
+        return 0
     tray = TrayApp(app)
     tray.show_when_tray_ready()
     log.info('ClipSend %s started (Qt: %s, clipboard: %s)', VERSION, QT_API,
