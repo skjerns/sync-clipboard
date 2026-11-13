@@ -169,6 +169,7 @@ DEFAULTS = {
     'max_age_min': 60,
     'receive_enabled': True,
     'apply_to_clipboard': True,
+    'set_selection': True,        # Linux: also replace the primary selection (middle-click paste)
     'download_dir': os.path.join(os.path.expanduser('~'), 'Downloads', 'ClipSend'),
     'use_push': True,
     'poll_interval': 0.5,
@@ -742,6 +743,7 @@ class Clipboard:
     """Wayland: wl-clipboard (works without focus via data-control on KWin). X11: QClipboard."""
 
     def __init__(self):
+        self.selection = False     # also write the primary selection (Linux, set by the tray app)
         self.wl = is_wayland() and shutil.which('wl-paste') and shutil.which('wl-copy')
         if is_wayland() and not self.wl:
             log.warning('Wayland session but wl-clipboard is missing; clipboard access may fail')
@@ -859,35 +861,57 @@ class Clipboard:
     # ---- writing ----
     def _wl_copy(self, mime, data):
         # stdout/stderr must not be pipes: wl-copy forks a server that keeps them open
-        p = subprocess.Popen(['wl-copy', '--type', mime], stdin=subprocess.PIPE,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        p.communicate(data, timeout=10)
-        if p.returncode != 0:
-            raise OSError(f'wl-copy failed ({p.returncode})')
+        for extra in (['--primary'] if self.selection else []) + [None]:
+            p = subprocess.Popen(['wl-copy', '--type', mime] + ([extra] if extra else []),
+                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            p.communicate(data, timeout=10)
+            if p.returncode != 0:
+                if extra:           # compositor without primary selection: the clipboard still counts
+                    log.warning('wl-copy --primary failed (%s)', p.returncode)
+                    continue
+                raise OSError(f'wl-copy failed ({p.returncode})')
+
+    def _qt_set(self, make_mime):
+        """make_mime() builds a fresh QMimeData for each buffer (Qt takes ownership)."""
+        cb = QtGui.QGuiApplication.clipboard()
+        if self.selection and cb.supportsSelection():
+            cb.setMimeData(make_mime(), qenum(QtGui.QClipboard, 'Mode', 'Selection'))
+        cb.setMimeData(make_mime(), qenum(QtGui.QClipboard, 'Mode', 'Clipboard'))
 
     def set_text(self, text):
         if self.wl:
             return self._wl_copy('text/plain;charset=utf-8', text.encode('utf-8', 'surrogatepass'))
-        QtGui.QGuiApplication.clipboard().setText(text)
+
+        def make():
+            md = QtCore.QMimeData()
+            md.setText(text)
+            return md
+        self._qt_set(make)
 
     def set_image(self, mime, data):
         if self.wl:
             return self._wl_copy(mime, data)
-        md = QtCore.QMimeData()
-        md.setData(mime, QtCore.QByteArray(data))
         img = QtGui.QImage.fromData(data)
-        if not img.isNull():
-            md.setImageData(img)
-        QtGui.QGuiApplication.clipboard().setMimeData(md)
+
+        def make():
+            md = QtCore.QMimeData()
+            md.setData(mime, QtCore.QByteArray(data))
+            if not img.isNull():
+                md.setImageData(img)
+            return md
+        self._qt_set(make)
 
     def set_files(self, paths):
         uris = [QtCore.QUrl.fromLocalFile(p) for p in paths]
         if self.wl:
             data = ''.join(bytes(u.toEncoded()).decode('ascii') + '\r\n' for u in uris)
             return self._wl_copy('text/uri-list', data.encode('ascii'))
-        md = QtCore.QMimeData()
-        md.setUrls(uris)
-        QtGui.QGuiApplication.clipboard().setMimeData(md)
+
+        def make():
+            md = QtCore.QMimeData()
+            md.setUrls(uris)
+            return md
+        self._qt_set(make)
 
 
 # --------------------------------------------------------------------------- #
@@ -1627,6 +1651,10 @@ class SettingsDialog(QtWidgets.QDialog):
         self.recv.setChecked(cfg['receive_enabled'])
         self.apply = W.QCheckBox('Put received items into the clipboard')
         self.apply.setChecked(cfg['apply_to_clipboard'])
+        self.selection = W.QCheckBox('Copy to clipboard and selection (replaces both; middle-click pastes it too)')
+        self.selection.setChecked(cfg['set_selection'])
+        self.selection.setEnabled(cfg['apply_to_clipboard'])
+        self.apply.toggled.connect(self.selection.setEnabled)
         row = W.QHBoxLayout()
         self.ddir = W.QLineEdit(cfg['download_dir'])
         b = W.QPushButton('…')
@@ -1647,6 +1675,8 @@ class SettingsDialog(QtWidgets.QDialog):
         self.age.setValue(cfg['max_age_min'])
         f.addRow(self.recv)
         f.addRow(self.apply)
+        if not WINDOWS:             # Windows has no primary selection
+            f.addRow(self.selection)
         f.addRow('Save received files to', row)
         f.addRow(self.push)
         f.addRow('Poll interval (no push)', self.poll)
@@ -1698,7 +1728,7 @@ class SettingsDialog(QtWidgets.QDialog):
                  app_password=self.pw.text().strip(), remote_dir=self.rdir.text().strip(),
                  server_ip=self.ip.text().strip(), device_name=self.dev.text().strip(),
                  max_size_mb=self.maxsize.value(), receive_enabled=self.recv.isChecked(),
-                 apply_to_clipboard=self.apply.isChecked(),
+                 apply_to_clipboard=self.apply.isChecked(), set_selection=self.selection.isChecked(),
                  download_dir=os.path.expanduser(self.ddir.text().strip()) or DEFAULTS['download_dir'],
                  use_push=self.push.isChecked(), poll_interval=self.poll.value(),
                  max_age_min=self.age.value(), passphrase=self.pp.text(),
@@ -1823,6 +1853,7 @@ class TrayApp(QtCore.QObject):
         self.app = app
         self.cfg = load_config()
         self.clip = Clipboard()
+        self.clip.selection = self.cfg['set_selection'] and not WINDOWS
         self.engine = None
         self.devices = []
         self.state = 'not configured'
@@ -2041,6 +2072,7 @@ class TrayApp(QtCore.QObject):
         try:
             if qexec(self.dialog):
                 self.cfg = self.dialog.cfg
+                self.clip.selection = self.cfg['set_selection'] and not WINDOWS
                 save_config(self.cfg)
                 self._restart_engine()
                 self._update_tooltip()

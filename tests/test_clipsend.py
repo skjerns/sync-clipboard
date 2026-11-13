@@ -331,3 +331,45 @@ def test_sleep_detects_resume(monkeypatch):
     t0 = time.monotonic()
     assert eng._sleep(60) is True
     assert time.monotonic() - t0 < 5
+
+
+# ---------------------------------------------------------------- clipboard + selection
+def test_wayland_writes_clipboard_and_selection(monkeypatch):
+    calls = []
+
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, args, **kw):
+            calls.append(args)
+
+        def communicate(self, data, timeout=None):
+            pass
+    monkeypatch.setattr(cs.subprocess, 'Popen', FakePopen)
+    cb = cs.Clipboard()
+    cb.wl = True
+    cb.selection = True
+    cb.set_text('hi')
+    assert ['wl-copy', '--type', 'text/plain;charset=utf-8', '--primary'] in calls
+    assert ['wl-copy', '--type', 'text/plain;charset=utf-8'] in calls
+    calls.clear()
+    cb.selection = False
+    cb.set_files(['/tmp/x'])
+    assert calls == [['wl-copy', '--type', 'text/uri-list']]
+
+
+def test_qt_writes_clipboard_and_selection(qapp, monkeypatch):
+    modes = []
+    class FakeCb:
+        def supportsSelection(self):
+            return True
+
+        def setMimeData(self, md, mode):
+            modes.append((mode, md.text()))
+    monkeypatch.setattr(cs.QtGui.QGuiApplication, 'clipboard', staticmethod(lambda: FakeCb()))
+    cb = cs.Clipboard()
+    cb.wl = False
+    cb.selection = True
+    cb.set_text('hi')
+    Mode = cs.QtGui.QClipboard.Mode
+    assert modes == [(Mode.Selection, 'hi'), (Mode.Clipboard, 'hi')]

@@ -73,7 +73,8 @@ Open them with right-click → Settings…; they're stored in `~/.config/clipsen
   (in case DNS can't resolve the server)
 * device name, and the default target for left-click (all other devices or one)
 * **max. transfer size** (default 5 MB), which applies to both sending and receiving
-* receive on/off, put received items into the clipboard, download folder
+* receive on/off, put received items into the clipboard (Linux: clipboard and
+  selection by default, so middle-click pastes them too), download folder
 * instant push on/off, poll interval (default 0.5 s), discard items older than N minutes
 * **shared passphrase** for end-to-end encryption
 * popups for sent and for received items, switchable independently (errors are always shown)
