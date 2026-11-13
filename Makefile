@@ -62,9 +62,10 @@ check:
 
 install: check
 	install -d $(APPDIR) $(BINDIR) $(APPSDIR) $(AUTOSTART) $(ICONDIR)
-	install -m 644 clipsend.py $(APPDIR)/clipsend.py
+	install -m 644 clipsendx.py $(APPDIR)/clipsendx.py
+	rm -f $(APPDIR)/clipsend.py
 	install -m 644 clipsend.svg $(ICONDIR)/clipsend.svg
-	printf '#!/bin/sh\nexec "%s" "%s" "$$@"\n' "$(PYTHON)" "$(APPDIR)/clipsend.py" > $(LAUNCHER)
+	printf '#!/bin/sh\nexec "%s" "%s" "$$@"\n' "$(PYTHON)" "$(APPDIR)/clipsendx.py" > $(LAUNCHER)
 	chmod 755 $(LAUNCHER)
 	echo "$$DESKTOP" > $(APPSDIR)/clipsend.desktop
 	echo "$$DESKTOP" > $(AUTOSTART)/clipsend.desktop

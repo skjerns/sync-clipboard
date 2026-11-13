@@ -11,7 +11,7 @@ import pytest
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-import clipsend as cs  # noqa: E402
+import clipsendx as cs  # noqa: E402
 
 MB = 5 * 1024 * 1024
 BASE = {'v': 2, 'from': 'a', 'to': 'b'}
@@ -169,7 +169,7 @@ def test_control_channel(qapp, tmp_path, monkeypatch):
     server.start()
     try:
         # the client side runs as a separate process, exactly like `clipsend --send`
-        script = os.path.join(os.path.dirname(__file__), '..', 'clipsend.py')
+        script = os.path.join(os.path.dirname(__file__), '..', 'clipsendx.py')
         proc = subprocess.Popen([sys.executable, script, '--send'])
         end = time.time() + 30
         while (proc.poll() is None or not got) and time.time() < end:
@@ -179,8 +179,8 @@ def test_control_channel(qapp, tmp_path, monkeypatch):
         assert got == ['send']
         # unknown commands are refused (again from a separate process: a QLocalSocket made in
         # a Python thread without event loop leaves dangling Qt objects on Windows)
-        code = ('import sys; sys.path.insert(0, sys.argv[1]); import clipsend; '
-                'sys.exit(0 if clipsend.send_command("rm -rf") is False else 3)')
+        code = ('import sys; sys.path.insert(0, sys.argv[1]); import clipsendx; '
+                'sys.exit(0 if clipsendx.send_command("rm -rf") is False else 3)')
         proc = subprocess.Popen([sys.executable, '-c', code, os.path.dirname(script)])
         while proc.poll() is None and time.time() < end:
             qapp.processEvents()
@@ -207,7 +207,7 @@ def test_windows_install_uninstall(monkeypatch, tmp_path):
     winreg = cs.winreg
     monkeypatch.setattr(cs, 'INSTALL_DIR', str(tmp_path / 'Programs' / 'ClipSend'))
     argv = cs.win_install(start=False)
-    assert os.path.exists(os.path.join(cs.INSTALL_DIR, 'clipsend.py'))
+    assert os.path.exists(os.path.join(cs.INSTALL_DIR, 'clipsendx.py'))
     assert os.path.exists(cs.start_menu_lnk())
     assert cs.get_autostart()
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, cs.RUN_KEY) as k:

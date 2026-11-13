@@ -31,8 +31,8 @@ if (-not $py) {
 Write-Host "Using Python: $py"
 
 if ($Uninstall) {
-    $installed = Join-Path $env:LOCALAPPDATA 'Programs\ClipSend\clipsend.py'
-    $script = if (Test-Path -LiteralPath $installed) { $installed } else { Join-Path $PSScriptRoot 'clipsend.py' }
+    $installed = Join-Path $env:LOCALAPPDATA 'Programs\ClipSend\clipsendx.py'
+    $script = if (Test-Path -LiteralPath $installed) { $installed } else { Join-Path $PSScriptRoot 'clipsendx.py' }
     & $py $script --uninstall
     exit $LASTEXITCODE
 }
@@ -43,10 +43,10 @@ Write-Host 'Installing Python packages (PySide6, requests, cryptography, websock
 if ($LASTEXITCODE -ne 0) { Write-Host 'pip install failed.' -ForegroundColor Red; exit 1 }
 
 if (Test-Path -LiteralPath 'credentials.json') {
-    & $py clipsend.py --import-legacy credentials.json
+    & $py clipsendx.py --import-legacy credentials.json
 }
 
-& $py clipsend.py --install
+& $py clipsendx.py --install
 if ($LASTEXITCODE -ne 0) { Write-Host 'Installation failed.' -ForegroundColor Red; exit 1 }
 
 Write-Host ''

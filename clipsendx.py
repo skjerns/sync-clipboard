@@ -1447,7 +1447,7 @@ def launch_argv(installed=False):
     """Command line that starts ClipSend (the installed copy if installed=True)."""
     if FROZEN:
         return [os.path.join(INSTALL_DIR, 'ClipSend.exe') if installed else sys.executable]
-    script = os.path.join(INSTALL_DIR, 'clipsend.py') if installed else os.path.abspath(__file__)
+    script = os.path.join(INSTALL_DIR, 'clipsendx.py') if installed else os.path.abspath(__file__)
     return [pythonw(), script]
 
 
@@ -1510,9 +1510,13 @@ def win_install(start=True):
         src_files = {sys.executable: 'ClipSend.exe'}
     else:
         here = os.path.dirname(os.path.abspath(__file__))
-        src_files = {os.path.abspath(__file__): 'clipsend.py'}
+        src_files = {os.path.abspath(__file__): 'clipsendx.py'}
         if os.path.exists(os.path.join(here, 'clipsend.ico')):
             src_files[os.path.join(here, 'clipsend.ico')] = 'clipsend.ico'
+    try:                              # script name before the rename to clipsendx.py
+        os.remove(os.path.join(INSTALL_DIR, 'clipsend.py'))
+    except OSError:
+        pass
     for src, name in src_files.items():
         dst = os.path.join(INSTALL_DIR, name)
         if os.path.normcase(os.path.abspath(src)) != os.path.normcase(dst):

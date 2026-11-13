@@ -46,7 +46,7 @@ jobs:
           --hidden-import PySide6.QtCore --hidden-import PySide6.QtGui
           --hidden-import PySide6.QtWidgets --hidden-import PySide6.QtNetwork
           --exclude-module PyQt5 --exclude-module PyQt6 --exclude-module tkinter
-          clipsend.py
+          clipsendx.py
       - name: Smoke test (start, quit, install, uninstall)
         shell: pwsh
         run: |
