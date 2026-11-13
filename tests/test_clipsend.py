@@ -244,14 +244,25 @@ class FakeDav:
         self.resets += 1
 
 
+class Recorder(cs.QtCore.QObject):
+    """QObject receiver like TrayApp (a bare list.append as slot crashes PySide6 on Windows)."""
+    def __init__(self):
+        super().__init__()
+        self.states = []
+
+    def on_status(self, s):
+        self.states.append(s)
+
+
 def make_engine(**over):
     cfg = {**cs.DEFAULTS, 'server_url': 'https://cloud.example.com', 'user': 'u', 'app_password': 'p',
            'device_name': 'me', 'use_push': False, 'poll_interval': 0.05, **over}
     eng = cs.Engine(cfg)
     eng.dav = FakeDav()
-    states = []
-    eng.status.connect(states.append)
-    return eng, states
+    rec = Recorder()
+    eng.status.connect(rec.on_status)
+    eng._rec = rec                                 # keep alive
+    return eng, rec.states
 
 
 def wait_until(cond, timeout=10):
