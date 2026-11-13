@@ -628,11 +628,21 @@ class WebDav:
             self._local.s = s
         return s
 
+    def reset(self):
+        """Drop this thread's pooled connections (they are dead after suspend / network change)."""
+        s = getattr(self._local, 's', None)
+        self._local.s = None
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
     def url(self, path):
         return self.root + urllib.parse.quote(path)
 
-    def _req(self, method, path, ok=(200, 201, 204, 207), stream=False, **kw):
-        r = self.s.request(method, self.url(path), timeout=(10, 30), allow_redirects=False,
+    def _req(self, method, path, ok=(200, 201, 204, 207), stream=False, timeout=(10, 30), **kw):
+        r = self.s.request(method, self.url(path), timeout=timeout, allow_redirects=False,
                            stream=stream, **kw)
         if r.status_code == 401:
             r.close()
@@ -654,7 +664,8 @@ class WebDav:
     def propfind(self, path, depth):
         body = ('<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop>'
                 '<d:getetag/><d:getcontentlength/><d:resourcetype/></d:prop></d:propfind>')
-        r = self._req('PROPFIND', path, ok=(207, 404), stream=True, data=body,
+        # short timeouts: a poll stuck on a dead connection would keep the state stale
+        r = self._req('PROPFIND', path, ok=(207, 404), stream=True, data=body, timeout=(6, 10),
                       headers={'Depth': str(depth), 'Content-Type': 'application/xml'})
         if r.status_code == 404:
             r.close()
@@ -884,6 +895,7 @@ class Clipboard:
 # --------------------------------------------------------------------------- #
 class Engine(QtCore.QObject):
     received = Signal(object)        # validated message dict
+    receiving = Signal(bool)         # downloading incoming items (tray icon blinks)
     sent = Signal(str)               # summary
     error = Signal(str, str)         # title, message
     status = Signal(str)             # short status for the tooltip
@@ -904,6 +916,8 @@ class Engine(QtCore.QObject):
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._send_lock = threading.Lock()
+        self._status_lock = threading.Lock()
+        self._last_status = None
         self._ws = None
 
     # ---- lifecycle ----
@@ -929,16 +943,52 @@ class Engine(QtCore.QObject):
         if not self._stop.is_set():
             sig.emit(*args)
 
+    # ---- connection state (one place, so the tray icon cannot get out of sync) ----
+    def _set_status(self, s):
+        with self._status_lock:
+            if s == self._last_status:
+                return
+            self._last_status = s
+        log.info('state: %s', s)
+        self._emit(self.status, s)
+
+    def _mark_ok(self):
+        """Any successful request (poll, send, push) proves we are connected."""
+        self._set_status('connected (push)' if self.push_ok else 'connected')
+
+    def _mark_failed(self, e):
+        self._set_status(f'offline ({type(e).__name__}), retrying')
+
+    def _sleep(self, delay):
+        """Wait for `delay` seconds, a wake() or a resume from suspend (returns True then).
+        Waits in short slices: monotonic clocks stop during suspend, the wall clock does not."""
+        end = time.monotonic() + delay
+        resumed = False
+        while not self._stop.is_set():
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            step = min(left, 2.0)
+            wall = time.time()
+            if self._wake.wait(step):
+                break
+            if time.time() - wall > step + 5:
+                log.info('system resumed from suspend')
+                resumed = True
+                break
+        self._wake.clear()
+        return resumed
+
     # ---- receiving ----
     def _poll_loop(self):
-        last_etag, backoff, next_dev_refresh = None, 0.0, 0.0
+        last_etag, fails, next_dev_refresh = None, 0, 0.0
         ready = False
         while not self._stop.is_set():
+            delay = None
             try:
                 if not ready:
                     self.dav.makedirs(self.inbox)
                     ready = True
-                    self._emit(self.status, 'connected')
                 if self.cfg['receive_enabled']:
                     etag = self.dav.etag(self.inbox)
                     if etag is None:
@@ -949,30 +999,43 @@ class Engine(QtCore.QObject):
                 if time.monotonic() >= next_dev_refresh:
                     self.refresh_devices()
                     next_dev_refresh = time.monotonic() + 60
-                if backoff:
-                    self._emit(self.status, 'connected')
-                backoff = 0.0
+                fails = 0
+                self._mark_ok()
             except AuthError as e:
-                self._emit(self.error, 'ClipSend: login failed', str(e))
-                self._emit(self.status, 'login failed')
-                backoff = 600.0       # do not hammer the server (brute-force lockout)
+                if self._last_status != 'login failed':
+                    self._emit(self.error, 'ClipSend: login failed', str(e))
+                self._set_status('login failed')
+                delay = 600.0         # do not hammer the server (brute-force lockout)
             except Exception as e:
+                fails += 1
                 log.warning('poll error: %s', e)
-                backoff = min(60.0, max(2.0, backoff * 2))
-                self._emit(self.status, f'offline ({type(e).__name__}), retrying')
-            if backoff:
-                interval = backoff
-            elif self.push_ok:
-                interval = 30.0       # push is the main signal; this is only a safety net
-            else:
-                interval = self.cfg['poll_interval']
-            self._wake.wait(interval)
-            self._wake.clear()
+                # pooled keep-alive connections are dead after suspend / network change and
+                # can stay broken: always reconnect from scratch
+                self.dav.reset()
+                if fails == 1:
+                    delay = 0.3       # usually just a stale connection: retry at once, keep the state
+                else:
+                    self._mark_failed(e)
+                    delay = min(15.0, 2.0 * 2 ** (fails - 2))
+            if delay is None:
+                delay = 30.0 if self.push_ok else self.cfg['poll_interval']
+            if self._sleep(delay):
+                fails = min(fails, 1)  # resumed: retry quickly instead of waiting out the backoff
+                self.dav.reset()
 
     def _process_inbox(self):
         entries = self.dav.listdir(self.inbox) or []
         msgs = sorted((e for e in entries if not e['dir'] and MSG_RE.match(e['name'])),
                       key=lambda e: e['name'])[:MAX_BATCH]
+        if not msgs:
+            return
+        self._emit(self.receiving, True)
+        try:
+            self._process_items(msgs)
+        finally:
+            self._emit(self.receiving, False)
+
+    def _process_items(self, msgs):
         cap = wire_cap(self.max_bytes)
         for e in msgs:
             if self._stop.is_set():
@@ -1039,7 +1102,6 @@ class Engine(QtCore.QObject):
                     endpoint = ((caps.get('notify_push') or {}).get('endpoints') or {}).get('websocket')
                     if not endpoint:
                         log.info('server has no notify_push app: polling every %.1fs', self.cfg['poll_interval'])
-                        self._emit(self.status, 'connected (polling)')
                         return
                     u = urllib.parse.urlsplit(endpoint)
                     if u.scheme != 'wss' and u.hostname not in ('localhost', '127.0.0.1'):
@@ -1058,7 +1120,7 @@ class Engine(QtCore.QObject):
                     return
                 log.info('push connected (%s)', endpoint)
                 self.push_ok = True
-                self._emit(self.status, 'connected (push)')
+                self._mark_ok()
                 self._wake.set()          # check once right away
                 backoff = 5
                 while not self._stop.is_set():
@@ -1074,7 +1136,9 @@ class Engine(QtCore.QObject):
                     break
                 log.info('push connection lost (%s), reconnect in %ss', e, backoff)
             finally:
-                self.push_ok = False
+                if self.push_ok:
+                    self.push_ok = False
+                    self._wake.set()      # poll right away; it updates the state
                 if self._ws is not None:
                     try:
                         self._ws.close()
@@ -1128,6 +1192,7 @@ class Engine(QtCore.QObject):
                 self._cleanup_stale(tdir)
                 self.dav.put(f'{tdir}/{name}', blob)
                 log.info('sent %s to %s (%s on the wire)', kind, t, human_size(len(blob)))
+            self._mark_ok()
             self._emit(self.sent, f'{summary} → {", ".join(targets)}')
         except Rejected as e:
             self._emit(self.error, 'ClipSend: not sent', clean_display(str(e), 300))
@@ -1136,7 +1201,9 @@ class Engine(QtCore.QObject):
         except Exception as e:
             log.exception('send failed')
             self._emit(self.error, 'ClipSend: send failed', clean_display(f'{type(e).__name__}: {e}', 300))
+            self._wake.set()          # let the poll loop re-check the connection
         finally:
+            self.dav.reset()          # this thread ends; do not leak its connections
             self._send_lock.release()
 
     def _cleanup_stale(self, tdir):
@@ -1706,18 +1773,21 @@ class SettingsDialog(QtWidgets.QDialog):
 # Klipper's clipboard icon. The colour shows the state. Drawn with QPainter,
 # so no SVG plugin is needed; clipsend.svg is the same design for launchers.
 ICON_COLORS = {
-    'idle': ('#7b3fe4', '#00b4d8'),      # violet -> cyan
-    'busy': ('#ff6d00', '#ffb300'),      # orange (sending)
-    'recv': ('#00a86b', '#2ed3a0'),      # green (received)
-    'offline': ('#6b7280', '#9ca3af'),   # grey (not configured / offline)
+    'app': ('#7b3fe4', '#00b4d8'),          # violet -> cyan (windows, launcher)
+    'connected': ('#00a86b', '#2ed3a0'),    # green
+    'busy': ('#ff6d00', '#ffb300'),         # orange (sending)
+    'recv': ('#1565c0', '#42a5f5'),         # blue (receiving, blinks)
+    'recv_dim': ('#1565c0', '#42a5f5', 0.3),
+    'offline': ('#6b7280', '#9ca3af'),      # grey (not configured / connecting / offline)
 }
 _ICONS = {}
 
 
-def _paint_icon(size, c1, c2):
+def _paint_icon(size, c1, c2, opacity=1.0):
     pm = QtGui.QPixmap(size, size)
     pm.fill(QtGui.QColor(0, 0, 0, 0))
     p = QtGui.QPainter(pm)
+    p.setOpacity(opacity)
     p.setRenderHint(qenum(QtGui.QPainter, 'RenderHint', 'Antialiasing'))
     p.scale(size / 64.0, size / 64.0)
     grad = QtGui.QLinearGradient(0, 0, 64, 64)
@@ -1737,7 +1807,7 @@ def _paint_icon(size, c1, c2):
     return pm
 
 
-def app_icon(state='idle'):
+def app_icon(state='app'):
     ic = _ICONS.get(state)
     if ic is None:
         ic = QtGui.QIcon()
@@ -1758,11 +1828,15 @@ class TrayApp(QtCore.QObject):
         self.state = 'not configured'
         self.dialog = None
         self._sending = False
+        self._receiving = False
+        self._blink_on = False
+        self._blink_until = 0.0
+        self._blink = QtCore.QTimer(self)
+        self._blink.setInterval(350)
+        self._blink.timeout.connect(self._blink_tick)
+        self._icon_key = 'offline'
 
-        self.icon_idle = app_icon('offline')
-        self.icon_busy = app_icon('busy')
-        self.icon_recv = app_icon('recv')
-        self.tray = QtWidgets.QSystemTrayIcon(self.icon_idle, self)
+        self.tray = QtWidgets.QSystemTrayIcon(app_icon('offline'), self)
         self.tray.activated.connect(self._activated)
 
         self.menu = QtWidgets.QMenu()
@@ -1806,6 +1880,7 @@ class TrayApp(QtCore.QObject):
             self.notify('ClipSend: configuration error', clean_display(str(e), 300), error=True)
             return
         self.engine.received.connect(self._on_received)
+        self.engine.receiving.connect(self._on_receiving)
         self.engine.sent.connect(self._on_sent)
         self.engine.error.connect(self._on_error)
         self.engine.status.connect(self._on_status)
@@ -1822,10 +1897,41 @@ class TrayApp(QtCore.QObject):
         self.devices = devs
         self._update_tooltip()
 
+    # ---- tray icon: grey = offline, green = connected, orange = sending, blinking blue = receiving
+    def _refresh_icon(self):
+        if self._sending:
+            key = 'busy'
+        elif self._blink.isActive():
+            key = 'recv' if self._blink_on else 'recv_dim'
+        elif self.engine and self.state.startswith('connected'):
+            key = 'connected'
+        else:
+            key = 'offline'
+        if key != self._icon_key:
+            self._icon_key = key
+            self.tray.setIcon(app_icon(key))
+
+    def _start_blink(self, min_seconds):
+        self._blink_until = max(self._blink_until, time.monotonic() + min_seconds)
+        if not self._blink.isActive():
+            self._blink_on = True
+            self._blink.start()
+        self._refresh_icon()
+
+    def _blink_tick(self):
+        if not self._receiving and time.monotonic() >= self._blink_until:
+            self._blink.stop()
+        else:
+            self._blink_on = not self._blink_on
+        self._refresh_icon()
+
+    def _on_receiving(self, active):
+        self._receiving = active
+        if active:
+            self._start_blink(0.7)
+
     def _update_tooltip(self):
-        self.icon_idle = app_icon('idle' if self.state.startswith('connected') else 'offline')
-        if not self._sending:
-            self.tray.setIcon(self.icon_idle)
+        self._refresh_icon()
         tgt = 'all other devices' if self.cfg['target'] == '*' else self.cfg['target']
         tip = (f'ClipSend – {self.cfg["device_name"]} ({self.state})\n'
                f'Left-click: send clipboard to {tgt}')
@@ -1879,17 +1985,17 @@ class TrayApp(QtCore.QObject):
             self.notify('ClipSend', 'Clipboard is empty (or has an unsupported type).', error=True)
             return
         self._sending = True
-        self.tray.setIcon(self.icon_busy)
+        self._refresh_icon()
         self.engine.send_async(content, target or self.cfg['target'])
 
     def _on_sent(self, summary):
         self._sending = False
-        self.tray.setIcon(self.icon_idle)
+        self._refresh_icon()
         self.notify('Clipboard sent', clean_display(summary, 200), kind='sent')
 
     def _on_error(self, title, msg):
         self._sending = False
-        self.tray.setIcon(self.icon_idle)
+        self._refresh_icon()
         self.notify(title, msg, error=True)
 
     def _on_received(self, msg):
@@ -1913,8 +2019,7 @@ class TrayApp(QtCore.QObject):
             log.exception('applying received item failed')
             self.notify('ClipSend: could not set clipboard', clean_display(str(e), 300), error=True)
             return
-        self.tray.setIcon(self.icon_recv)
-        QtCore.QTimer.singleShot(2500, lambda: self.tray.setIcon(self.icon_idle))
+        self._start_blink(2.5)
         self.notify('Clipboard received', body, kind='received')
 
     def _toggle_recv(self, on):

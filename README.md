@@ -17,6 +17,11 @@ saved to `~/Downloads/ClipSend/<date>_<sender>/` and put on the clipboard as
 files, so you can paste them in Dolphin with Ctrl+V. On Windows, received files
 go to `%USERPROFILE%\Downloads\ClipSend\` and can be pasted in Explorer.
 
+The tray icon's colour shows the state: **green** means connected, **grey**
+means offline or not configured, **orange** means sending, and **blinking
+blue** means receiving. After a suspend or a network change, ClipSend
+reconnects within a few seconds.
+
 ## Install on Linux
 
 ```sh

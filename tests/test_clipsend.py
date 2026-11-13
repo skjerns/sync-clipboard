@@ -211,3 +211,108 @@ def test_windows_install_uninstall(monkeypatch, tmp_path):
     assert not cs.get_autostart()
     assert not os.path.exists(cs.start_menu_lnk())
     assert not os.path.exists(cs.INSTALL_DIR)
+
+
+# ---------------------------------------------------------------- connection state
+class FakeDav:
+    """Stands in for WebDav: fails while `down` is set."""
+    def __init__(self):
+        self.down = False
+        self.resets = 0
+        self.puts = []
+
+    def _check(self):
+        if self.down:
+            raise ConnectionError('network is down')
+
+    def makedirs(self, path):
+        self._check()
+
+    def etag(self, path):
+        self._check()
+        return '"e1"'
+
+    def listdir(self, path):
+        self._check()
+        return []
+
+    def put(self, path, data):
+        self._check()
+        self.puts.append(path)
+
+    def reset(self):
+        self.resets += 1
+
+
+def make_engine(**over):
+    cfg = {**cs.DEFAULTS, 'server_url': 'https://cloud.example.com', 'user': 'u', 'app_password': 'p',
+           'device_name': 'me', 'use_push': False, 'poll_interval': 0.05, **over}
+    eng = cs.Engine(cfg)
+    eng.dav = FakeDav()
+    states = []
+    eng.status.connect(states.append)
+    return eng, states
+
+
+def wait_until(cond, timeout=10):
+    app = cs.QtWidgets.QApplication.instance()     # cross-thread signals are queued
+    end = time.time() + timeout
+    while not cond() and time.time() < end:
+        app.processEvents()
+        time.sleep(0.02)
+    app.processEvents()
+    return cond()
+
+
+def test_state_recovers_after_outage(qapp):
+    eng, states = make_engine()
+    eng.start()
+    try:
+        assert wait_until(lambda: states[-1:] == ['connected'])
+        eng.dav.down = True
+        assert wait_until(lambda: states[-1].startswith('offline'))
+        assert eng.dav.resets >= 2                      # broken connections are dropped
+        eng.dav.down = False
+        eng.wake()
+        assert wait_until(lambda: states[-1] == 'connected', timeout=5)
+        assert states == ['connected', states[1], 'connected']   # no flapping, no duplicates
+    finally:
+        eng.stop()
+
+
+def test_single_glitch_does_not_flash_offline(qapp):
+    eng, states = make_engine()
+    calls = []
+    real = eng.dav.etag
+
+    def flaky(path):
+        calls.append(1)
+        if len(calls) == 3:
+            raise ConnectionError('stale keep-alive connection')
+        return real(path)
+    eng.dav.etag = flaky
+    eng.start()
+    try:
+        assert wait_until(lambda: len(calls) > 6)
+        assert states == ['connected']
+    finally:
+        eng.stop()
+
+
+def test_successful_send_marks_connected(qapp):
+    eng, states = make_engine(receive_enabled=False)
+    eng._set_status('offline (ConnectionError), retrying')
+    eng.send_async({'kind': 'text', 'text': 'hi'}, 'other')
+    assert wait_until(lambda: states[-1:] == ['connected'])
+    assert len(eng.dav.puts) == 1
+
+
+def test_sleep_detects_resume(monkeypatch):
+    eng, _ = make_engine()
+    real = time.time
+    jump = {'t': 0.0}
+    monkeypatch.setattr(cs.time, 'time', lambda: real() + jump['t'])
+    threading.Timer(0.3, lambda: jump.update(t=3600.0)).start()    # "slept" for an hour
+    t0 = time.monotonic()
+    assert eng._sleep(60) is True
+    assert time.monotonic() - t0 < 5
