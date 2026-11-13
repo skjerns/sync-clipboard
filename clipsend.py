@@ -871,9 +871,13 @@ class Clipboard:
                     continue
                 raise OSError(f'wl-copy failed ({p.returncode})')
 
+    @staticmethod
+    def _qt_clipboard():
+        return QtGui.QGuiApplication.clipboard()
+
     def _qt_set(self, make_mime):
         """make_mime() builds a fresh QMimeData for each buffer (Qt takes ownership)."""
-        cb = QtGui.QGuiApplication.clipboard()
+        cb = self._qt_clipboard()
         if self.selection and cb.supportsSelection():
             cb.setMimeData(make_mime(), qenum(QtGui.QClipboard, 'Mode', 'Selection'))
         cb.setMimeData(make_mime(), qenum(QtGui.QClipboard, 'Mode', 'Clipboard'))

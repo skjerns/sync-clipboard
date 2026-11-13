@@ -25,7 +25,10 @@ def roundtrip(msg, sender=PLAIN, receiver=PLAIN, cap=MB):
 
 @pytest.fixture(scope='session')
 def qapp():
-    return cs.QtWidgets.QApplication.instance() or cs.QtWidgets.QApplication([])
+    app = cs.QtWidgets.QApplication.instance() or cs.QtWidgets.QApplication([])
+    yield app
+    # the offscreen platform segfaults at exit while it still owns a QMimeData
+    app.clipboard().clear()
 
 
 # ---------------------------------------------------------------- codec
@@ -358,7 +361,7 @@ def test_wayland_writes_clipboard_and_selection(monkeypatch):
     assert calls == [['wl-copy', '--type', 'text/uri-list']]
 
 
-def test_qt_writes_clipboard_and_selection(qapp, monkeypatch):
+def test_qt_writes_clipboard_and_selection(qapp):
     modes = []
     class FakeCb:
         def supportsSelection(self):
@@ -366,8 +369,8 @@ def test_qt_writes_clipboard_and_selection(qapp, monkeypatch):
 
         def setMimeData(self, md, mode):
             modes.append((mode, md.text()))
-    monkeypatch.setattr(cs.QtGui.QGuiApplication, 'clipboard', staticmethod(lambda: FakeCb()))
     cb = cs.Clipboard()
+    cb._qt_clipboard = FakeCb                     # instance attribute: Qt classes stay untouched
     cb.wl = False
     cb.selection = True
     cb.set_text('hi')
