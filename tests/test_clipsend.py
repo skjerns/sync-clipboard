@@ -174,15 +174,19 @@ def test_control_channel(qapp, tmp_path, monkeypatch):
             time.sleep(0.02)
         assert proc.returncode == 0
         assert got == ['send']
-        result = {}
-        t = threading.Thread(target=lambda: result.update(bad=cs.send_command('rm -rf')))
-        t.start()
-        while t.is_alive() and time.time() < end:
+        # unknown commands are refused (again from a separate process: a QLocalSocket made in
+        # a Python thread without event loop leaves dangling Qt objects on Windows)
+        code = ('import sys; sys.path.insert(0, sys.argv[1]); import clipsend; '
+                'sys.exit(0 if clipsend.send_command("rm -rf") is False else 3)')
+        proc = subprocess.Popen([sys.executable, '-c', code, os.path.dirname(script)])
+        while proc.poll() is None and time.time() < end:
             qapp.processEvents()
             time.sleep(0.02)
-        assert result == {'bad': False} and got == ['send']
+        assert proc.returncode == 0 and got == ['send']
     finally:
         server.close()
+        server.deleteLater()
+        qapp.processEvents()
 
 
 @pytest.mark.skipif(not cs.WINDOWS, reason='Windows only')
