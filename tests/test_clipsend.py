@@ -53,9 +53,9 @@ def test_image_roundtrip():
     ({'kind': 'text', 'text': 'x', 'to': 'c'}, PLAIN, PLAIN),        # not for me
     ({'kind': 'text', 'text': 'x', 'from': 'b'}, PLAIN, PLAIN),      # from myself
     ({'kind': 'text', 'text': 'x', 'from': '../x'}, PLAIN, PLAIN),   # bad sender
-    ({'kind': 'exec', 'cmd': 'rm -rf ~'}, PLAIN, PLAIN),             # unknown kind
+    ({'kind': 'other', 'x': 'y'}, PLAIN, PLAIN),                     # unknown kind
     ({'kind': 'image', 'mime': 'image/svg+xml', 'data': 'PHN2Zz4='}, PLAIN, PLAIN),
-    ({'kind': 'image', 'mime': 'image/png', 'data': base64.b64encode(b'MZ\x90\x00').decode()}, PLAIN, PLAIN),
+    ({'kind': 'image', 'mime': 'image/png', 'data': base64.b64encode(b'GIF89a\x01\x00').decode()}, PLAIN, PLAIN),
 ])
 def test_rejections(msg, sender, receiver):
     with pytest.raises(cs.Rejected):
@@ -87,52 +87,34 @@ def test_path_traversal_rejected(path):
         roundtrip({'kind': 'files', 'files': [{'path': path, 'data': ''}]})
 
 
-@pytest.mark.parametrize('name,expected', [
-    ('CON', '_CON'), ('nul.txt', '_nul.txt'), ('com1', '_com1'), ('LPT9.log', '_LPT9.log'),
-    ('file.txt:Zone.Identifier', 'file.txt_Zone.Identifier'), ('a<b>c|d?e*f"g', 'a_b_c_d_e_f_g'),
-    ('trailing. . ', 'trailing'), ('console.txt', 'console.txt'), ('normal name.pdf', 'normal name.pdf'),
-])
-def test_windows_name_sanitizing(name, expected):
-    assert cs.win_safe_component(name) == expected
-
-
 # ---------------------------------------------------------------- files
 def test_collect_and_write_files(tmp_path):
     src = tmp_path / 'src'
     (src / 'sub' / 'deeper').mkdir(parents=True)
     (src / 'a.txt').write_text('A')
-    binary = bytes(range(256)) * 10 + b'\r\n\n\r\x1a'          # catches text-mode writes on Windows
+    binary = bytes(range(256)) * 10 + b'\r\n\n\r\x1a'
     (src / 'sub' / 'deeper' / 'b.bin').write_bytes(binary)
     (tmp_path / 'single.bin').write_bytes(b'\x01' * 1000)
-    skipped_expected = 0
-    if hasattr(os, 'symlink'):
-        try:
-            os.symlink(tmp_path / 'single.bin', src / 'sub' / 'link')
-            skipped_expected = 1
-        except OSError:                     # Windows without symlink privilege
-            pass
+    os.symlink(tmp_path / 'single.bin', src / 'sub' / 'link')
+    skipped_expected = 1
     files, total, skipped = cs.collect_files([str(src), str(tmp_path / 'single.bin'),
                                               str(tmp_path / 'single.bin')], MB)
     assert skipped == skipped_expected
     with pytest.raises(cs.Rejected):
         cs.collect_files([str(tmp_path / 'single.bin')], 500)
 
-    evil = [{'path': 'evil‮txt.exe', 'data': ''}, {'path': 'CON', 'data': 'eA=='}]
-    r = roundtrip({'kind': 'files', 'files': files + evil})
+    odd = [{'path': 'name\u202egnp.txt', 'data': ''}, {'path': 'CON', 'data': 'eA=='}]
+    r = roundtrip({'kind': 'files', 'files': files + odd})
     dest, top, written = cs.write_received_files(r['files'], str(tmp_path / 'dl'), 'a')
     names = sorted(os.path.relpath(os.path.join(d, f), dest).replace(os.sep, '/')
                    for d, _, fs in os.walk(dest) for f in fs)
-    assert 'src/sub/deeper/b.bin' in names and 'single (2).bin' in names and 'eviltxt.exe' in names
-    assert ('_CON' if cs.WINDOWS else 'CON') in names
+    assert 'src/sub/deeper/b.bin' in names and 'single (2).bin' in names and 'namegnp.txt' in names
+    assert 'CON' in names
     assert open(os.path.join(dest, 'src', 'sub', 'deeper', 'b.bin'), 'rb').read() == binary
     assert written == total + 1
-    if not cs.WINDOWS:
-        for d, _, fs in os.walk(dest):
-            for f in fs:
-                assert not os.stat(os.path.join(d, f)).st_mode & 0o111, 'received file is executable'
-    else:
-        zone = open(os.path.join(dest, 'single.bin') + ':Zone.Identifier').read()
-        assert 'ZoneId=3' in zone
+    for d, _, fs in os.walk(dest):
+        for f in fs:
+            assert not os.stat(os.path.join(d, f)).st_mode & 0o111, 'received file is executable'
 
 
 # ---------------------------------------------------------------- Qt / platform
@@ -161,9 +143,8 @@ def test_qt_clipboard_roundtrip(qapp, tmp_path):
 
 
 def test_control_channel(qapp, tmp_path, monkeypatch):
-    if not cs.WINDOWS:
-        monkeypatch.setenv('XDG_RUNTIME_DIR', '/tmp' if len(str(tmp_path)) > 80 else str(tmp_path))
-    server = cs.WinControlServer() if cs.WINDOWS else cs.ControlServer()
+    monkeypatch.setenv('XDG_RUNTIME_DIR', '/tmp' if len(str(tmp_path)) > 80 else str(tmp_path))
+    server = cs.ControlServer()
     got = []
     server.command.connect(got.append)
     server.start()
@@ -177,10 +158,9 @@ def test_control_channel(qapp, tmp_path, monkeypatch):
             time.sleep(0.02)
         assert proc.returncode == 0
         assert got == ['send']
-        # unknown commands are refused (again from a separate process: a QLocalSocket made in
-        # a Python thread without event loop leaves dangling Qt objects on Windows)
+        # unknown commands are refused
         code = ('import sys; sys.path.insert(0, sys.argv[1]); import clipsendx; '
-                'sys.exit(0 if clipsendx.send_command("rm -rf") is False else 3)')
+                'sys.exit(0 if clipsendx.send_command("bogus") is False else 3)')
         proc = subprocess.Popen([sys.executable, '-c', code, os.path.dirname(script)])
         while proc.poll() is None and time.time() < end:
             qapp.processEvents()
@@ -190,34 +170,6 @@ def test_control_channel(qapp, tmp_path, monkeypatch):
         server.close()
         server.deleteLater()
         qapp.processEvents()
-
-
-@pytest.mark.skipif(not cs.WINDOWS, reason='Windows only')
-def test_windows_lock(tmp_path):
-    fd = cs.acquire_lock()
-    assert fd is not None
-    try:
-        assert cs.acquire_lock() is None
-    finally:
-        os.close(fd)
-
-
-@pytest.mark.skipif(not (cs.WINDOWS and os.environ.get('CI')), reason='modifies HKCU/Start Menu: CI only')
-def test_windows_install_uninstall(monkeypatch, tmp_path):
-    winreg = cs.winreg
-    monkeypatch.setattr(cs, 'INSTALL_DIR', str(tmp_path / 'Programs' / 'ClipSend'))
-    argv = cs.win_install(start=False)
-    assert os.path.exists(os.path.join(cs.INSTALL_DIR, 'clipsendx.py'))
-    assert os.path.exists(cs.start_menu_lnk())
-    assert cs.get_autostart()
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, cs.RUN_KEY) as k:
-        assert winreg.QueryValueEx(k, 'ClipSend')[0] == cs.quote_argv(argv)
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, cs.UNINSTALL_KEY) as k:
-        assert winreg.QueryValueEx(k, 'UninstallString')[0].endswith('--uninstall')
-    cs.win_uninstall()
-    assert not cs.get_autostart()
-    assert not os.path.exists(cs.start_menu_lnk())
-    assert not os.path.exists(cs.INSTALL_DIR)
 
 
 # ---------------------------------------------------------------- connection state
@@ -252,7 +204,7 @@ class FakeDav:
 
 
 class Recorder(cs.QtCore.QObject):
-    """QObject receiver like TrayApp (a bare list.append as slot crashes PySide6 on Windows)."""
+    """QObject receiver, like TrayApp."""
     def __init__(self):
         super().__init__()
         self.states = []
@@ -376,3 +328,21 @@ def test_qt_writes_clipboard_and_selection(qapp):
     cb.set_text('hi')
     Mode = cs.QtGui.QClipboard.Mode
     assert modes == [(Mode.Selection, 'hi'), (Mode.Clipboard, 'hi')]
+
+
+def test_certificate_error_pauses_polling(qapp):
+    import requests
+    eng, states = make_engine()
+    calls = []
+
+    def intercepted(path):
+        calls.append(1)
+        raise requests.exceptions.SSLError('certificate verify failed')
+    eng.dav.etag = intercepted
+    eng.start()
+    try:
+        assert wait_until(lambda: states[-1:] == ['certificate error'])
+        time.sleep(1.0)
+        assert len(calls) == 1                     # no retry storm against the firewall
+    finally:
+        eng.stop()

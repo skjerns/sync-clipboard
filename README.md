@@ -1,9 +1,9 @@
 # ClipSend
 
-Send your clipboard (text, images, or files copied in Dolphin / Explorer) to
+Send your clipboard (text, images, or files copied in Dolphin) to
 your other machine(s) with a single click on a tray icon. A Nextcloud account
 acts as the relay, so the machines don't need to be on the same network.
-Runs on Linux (KDE Plasma, X11 or Wayland) and Windows 10/11, in any mix.
+Runs on Linux (KDE Plasma, X11 or Wayland).
 
 | Action                            | Effect                                         |
 |-----------------------------------|------------------------------------------------|
@@ -14,8 +14,7 @@ Runs on Linux (KDE Plasma, X11 or Wayland) and Windows 10/11, in any mix.
 
 Received text and images go straight into the clipboard. Received files are
 saved to `~/Downloads/ClipSend/<date>_<sender>/` and put on the clipboard as
-files, so you can paste them in Dolphin with Ctrl+V. On Windows, received files
-go to `%USERPROFILE%\Downloads\ClipSend\` and can be pasted in Explorer.
+files, so you can paste them in Dolphin with Ctrl+V.
 
 The tray icon's colour shows the state: **green** means connected, **grey**
 means offline or not configured, **orange** means sending, and **blinking
@@ -44,36 +43,14 @@ Other targets: `make restart`, `make stop`, `make uninstall`, `make log`.
 → assign a key to the *Send clipboard* action. You can also add a custom command
 shortcut that runs `~/.local/bin/clipsend --send`.
 
-## Install on Windows
-
-Both options install for the current user only. No administrator rights are
-needed. ClipSend gets a Start Menu entry, starts at login, and shows up in
-*Settings → Apps → Installed apps*, where you can also uninstall it.
-
-* **Without Python:** download `ClipSend.exe` (from the
-  [Releases](../../releases) page, or the *ClipSend-windows* artifact of the
-  latest [Actions](../../actions) run), double-click it and choose **Install**.
-  To upgrade, do the same with a newer exe.
-* **With Python 3:** double-click `install-windows.bat` in this folder. It
-  installs the Python packages and then ClipSend. To remove it, run
-  `install-windows.bat -Uninstall`.
-
-New tray icons are often hidden in the `^` overflow area of the taskbar. Drag
-the icon onto the taskbar to keep it visible. Autostart can also be switched in
-Settings (*Start ClipSend when I log in to Windows*).
-
-Settings are stored in `%APPDATA%\ClipSend\config.json`, and the log is at
-`%LOCALAPPDATA%\ClipSend\clipsend.log`.
-
 ## Settings
 
 Open them with right-click → Settings…; they're stored in `~/.config/clipsend/config.json` (mode 600).
 
-* Nextcloud URL / user / app password / remote folder, optional fixed server IP
-  (in case DNS can't resolve the server)
+* Nextcloud URL / user / app password / remote folder
 * device name, and the default target for left-click (all other devices or one)
 * **max. transfer size** (default 5 MB), which applies to both sending and receiving
-* receive on/off, put received items into the clipboard (Linux: clipboard and
+* receive on/off, put received items into the clipboard (clipboard and
   selection by default, so middle-click pastes them too), download folder
 * instant push on/off, poll interval (default 0.5 s), discard items older than N minutes
 * **shared passphrase** for end-to-end encryption
@@ -96,14 +73,29 @@ websocket open and gets notified instantly. Otherwise it polls the *ETag of its
 own inbox folder*. That's a single tiny `PROPFIND` over a kept-alive HTTPS
 connection. It only lists and downloads when the ETag changes.
 
+## What ClipSend does on your machine and network
+
+ClipSend is a plain Python script, with nothing compiled, packed or obfuscated.
+
+* **Network:** HTTPS only, and only to the Nextcloud server in the settings.
+  It uses normal system DNS, the standard WebDAV and OCS endpoints and, if the
+  server offers it, the notify_push websocket on the same host. It
+  identifies itself with the User-Agent `ClipSend/<version>`. While receiving is
+  on, it checks its inbox at the poll interval (default 0.5 s). Turn
+  *Receive* off in the menu to stop that.
+* **Clipboard:** read only when you click the tray icon or run `--send`. Nothing
+  is ever sent on its own.
+* **Files:** settings in `~/.config/clipsend/`, the log in `~/.cache/clipsend/`,
+  received files in `~/Downloads/ClipSend/`. `make install` writes only to
+  `~/.local` and `~/.config/autostart`. No root rights are needed, and no system
+  files are changed.
+* **Processes:** it starts only `wl-copy` / `wl-paste` (Wayland), and your file
+  manager when you choose *Open received files*.
+
 ## Security notes
 
 * Received content is never executed. Files are written into a fresh directory
-  with `O_EXCL|O_NOFOLLOW` and without executable bits. On Windows, received
-  files get the "downloaded from the internet" mark (Mark of the Web), so
-  SmartScreen and Office warn before opening them. Windows-reserved names
-  (`CON`, `NUL`, …) and `:` (which would create hidden alternate data streams)
-  are neutralized. Path traversal
+  with `O_EXCL|O_NOFOLLOW` and without executable bits. Path traversal
   (`..`, absolute paths), control characters and bidi-override characters in
   names are rejected or stripped. Symlinks inside copied folders aren't sent.
 * There are size caps everywhere: on the clipboard read, on the download
@@ -118,7 +110,6 @@ connection. It only lists and downloads when the ETag changes.
   to the configured host. After a login failure ClipSend backs off for 10 min
   to avoid a brute-force lockout.
 * The local control channel only accepts connections from the same user and
-  knows four fixed commands. On Linux it's a socket in `$XDG_RUNTIME_DIR`; on
-  Windows it's a named pipe restricted to the current user.
+  knows four fixed commands. It's a socket in `$XDG_RUNTIME_DIR`.
 * Notifications escape all remote text, because KDE renders notification
   markup.
