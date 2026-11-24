@@ -61,7 +61,7 @@ except ImportError:
     sys.exit('ClipSend needs the Python package "cryptography" (pip install cryptography)')
 
 APP = 'clipsend'
-VERSION = '3.0'
+VERSION = '3.1'
 
 # --------------------------------------------------------------------------- #
 # paths
