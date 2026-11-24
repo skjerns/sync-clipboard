@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 """
 ClipSend - send your clipboard (text, images or files) to your other machine(s),
-using a Nextcloud account as relay.
+end-to-end encrypted, using Google Firebase or a Nextcloud account as relay.
 
   * Left-click the tray icon  -> send the current clipboard
   * Right-click               -> menu (send to..., settings, ...)
   * `clipsend --send`         -> same as left click (bind it to a keyboard shortcut)
 
-Runs on Linux (KDE Plasma, X11 or Wayland).
+Runs on Linux (KDE Plasma, X11 or Wayland) and Windows 10/11, as a plain
+Python script (nothing compiled, no installer).
 
-Transport: every device has an inbox folder on Nextcloud
-(<remote_dir>/inbox/<device>/).  Sending = one WebDAV PUT into the inbox of
-each target.  Receiving = the device watches its own inbox, either via
-Nextcloud's notify_push websocket (instant, if the server has the app) or by
-polling the inbox folder's ETag (one tiny PROPFIND over a kept-alive
-connection per interval).
+Transport: every device has an inbox, either a folder on Nextcloud
+(<remote_dir>/inbox/<device>/, via WebDAV) or a node in a Firebase Realtime
+Database (users/<uid>/inbox/<device>).  Sending = one write into the inbox of
+each target.  Receiving = the device watches its own inbox (Firebase event
+stream, or Nextcloud's notify_push websocket if the server has the app) or
+polls it, and deletes each item right after reading it.  Every client also
+deletes items older than max_age_min from all inboxes once a minute.
 """
 import argparse
 import base64
 import errno
+import faulthandler
+import hashlib
 import html
 import json
 import logging
@@ -39,21 +43,43 @@ import uuid
 import xml.etree.ElementTree as ET
 import zlib
 
-import fcntl
+WINDOWS = sys.platform == 'win32'
+if WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+
+try:
+    from cryptography.exceptions import InvalidSignature, InvalidTag
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+except ImportError:
+    sys.exit('ClipSend needs the Python package "cryptography" (pip install cryptography)')
 
 APP = 'clipsend'
-VERSION = '2.1'
+VERSION = '3.0'
 
 # --------------------------------------------------------------------------- #
 # paths
 # --------------------------------------------------------------------------- #
-CONFIG_DIR = os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'), APP)
-CACHE_DIR = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'), APP)
+if WINDOWS:
+    CONFIG_DIR = os.path.join(os.environ.get('APPDATA') or os.path.expanduser('~'), 'ClipSend')
+    CACHE_DIR = os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'), 'ClipSend')
+else:
+    CONFIG_DIR = os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'), APP)
+    CACHE_DIR = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'), APP)
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.json')
 LOG_FILE = os.path.join(CACHE_DIR, 'clipsend.log')
 
 
 def runtime_dir():
+    if WINDOWS:     # %LOCALAPPDATA% is private to the user by ACL
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        return CACHE_DIR
     d = os.environ.get('XDG_RUNTIME_DIR')
     if d and os.path.isdir(d) and os.access(d, os.W_OK):
         return d
@@ -101,8 +127,6 @@ def qexec(obj):
 # --------------------------------------------------------------------------- #
 # limits / constants
 # --------------------------------------------------------------------------- #
-MAGIC_PLAIN = b'CLIPSEND/2 plain\n'
-MAGIC_ENC = b'CLIPSEND/2 aesgcm\n'
 MSG_RE = re.compile(r'^(\d{13})-([0-9a-f]{32})\.clipsend$')
 DEVICE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 MAX_FILES = 2000                 # per message
@@ -129,12 +153,12 @@ def human_size(n):
 
 
 def clean_display(s, maxlen=120):
-    """Make untrusted text safe for a notification (KDE renders markup)."""
+    """Make untrusted text safe for a notification (KDE renders markup, Windows plain text)."""
     s = _BAD_CHARS.sub(' ', str(s))
     s = re.sub(r'\s+', ' ', s).strip()
     if len(s) > maxlen:
         s = s[:maxlen - 1] + '…'
-    return html.escape(s)
+    return s if WINDOWS else html.escape(s)
 
 
 def sanitize_device(name):
@@ -146,30 +170,33 @@ def sanitize_device(name):
 # configuration
 # --------------------------------------------------------------------------- #
 DEFAULTS = {
+    'backend': 'nextcloud',       # 'nextcloud' or 'firebase'
     'server_url': '',
     'user': '',
     'app_password': '',
     'remote_dir': '/ClipSend',
+    'fb_db_url': '',              # Firebase Realtime Database URL
+    'fb_api_key': '',             # Firebase Web API key (not secret, identifies the project)
+    'fb_email': '',
+    'fb_uid': '',
+    'fb_refresh_token': '',       # from signing in; the password itself is not stored
     'device_name': sanitize_device(socket.gethostname().split('.')[0]),
     'target': '*',                # '*' = all other devices
     'max_size_mb': 5.0,
-    'max_age_min': 60,
+    'max_age_min': 5,             # items older than this are deleted from the server
     'receive_enabled': True,
     'apply_to_clipboard': True,
     'set_selection': True,        # Linux: also replace the primary selection (middle-click paste)
     'download_dir': os.path.join(os.path.expanduser('~'), 'Downloads', 'ClipSend'),
     'use_push': True,
     'poll_interval': 0.5,
-    'passphrase': '',
+    'use_keyring': True,          # keep the device key's password in KWallet / Credential Manager
     'notify_sent': True,          # popup after sending
     'notify_received': True,      # popup after receiving (errors are always shown)
 }
 
 
 def _coerce(cfg):
-    cfg = dict(cfg)
-    for k in ('notify_sent', 'notify_received'):      # migrate the old single switch
-        cfg.setdefault(k, cfg.get('notifications', True))
     out = dict(DEFAULTS)
     for k, default in DEFAULTS.items():
         v = cfg.get(k, default)
@@ -191,13 +218,15 @@ def _coerce(cfg):
     out['device_name'] = sanitize_device(out['device_name'])
     if out['target'] != '*' and not DEVICE_RE.match(out['target']):
         out['target'] = '*'
+    if out['backend'] not in ('nextcloud', 'firebase'):
+        out['backend'] = 'nextcloud'
     return out
 
 
 def load_config():
     try:
         st = os.stat(CONFIG_FILE)
-        if st.st_mode & 0o077:
+        if not WINDOWS and st.st_mode & 0o077:
             os.chmod(CONFIG_FILE, 0o600)
         with open(CONFIG_FILE, encoding='utf-8') as f:
             data = json.load(f)
@@ -222,105 +251,322 @@ def save_config(cfg):
 
 
 def config_complete(cfg):
+    if cfg.get('backend') == 'firebase':
+        return all(cfg.get(k) for k in ('fb_db_url', 'fb_api_key', 'fb_uid', 'fb_refresh_token'))
     return all(cfg.get(k) for k in ('server_url', 'user', 'app_password', 'remote_dir'))
 
 
-def import_legacy(path):
-    """Import the credentials.json of the old sync-clip.py."""
-    with open(path, encoding='utf-8') as f:
-        old = json.load(f)
-    cfg = load_config()
-    if config_complete(cfg):
-        print(f'{CONFIG_FILE} already configured, not importing {path}')
-        return
-    cfg['server_url'] = old.get('url', '')
-    cfg['user'] = old.get('user', '')
-    cfg['app_password'] = old.get('app_password') or old.get('app_api_token') or old.get('password') or ''
-    cfg['remote_dir'] = old.get('remote_dir') or DEFAULTS['remote_dir']
-    save_config(cfg)
-    print(f'imported {path} -> {CONFIG_FILE}')
-
-
 # --------------------------------------------------------------------------- #
-# crypto (optional end-to-end encryption with a shared passphrase)
-# --------------------------------------------------------------------------- #
-class Crypto:
-    def __init__(self, passphrase):
-        self.passphrase = passphrase.encode('utf-8') if passphrase else b''
-        self._keys = {}
-        if self.passphrase:
-            from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: F401  (fail early)
-
-    @property
-    def enabled(self):
-        return bool(self.passphrase)
-
-    def _key(self, salt):
-        k = self._keys.get(salt)
-        if k is None:
-            from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-            k = Scrypt(salt=salt, length=32, n=2 ** 15, r=8, p=1).derive(self.passphrase)
-            if len(self._keys) > 64:
-                self._keys.clear()
-            self._keys[salt] = k
-        return k
-
-    def seal(self, plain):
-        if not self.enabled:
-            return MAGIC_PLAIN + plain
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        if not hasattr(self, '_send_salt'):
-            self._send_salt = secrets.token_bytes(16)
-        salt = self._send_salt
-        nonce = secrets.token_bytes(12)
-        ct = AESGCM(self._key(salt)).encrypt(nonce, plain, MAGIC_ENC + salt)
-        return MAGIC_ENC + salt + nonce + ct
-
-    def open(self, blob):
-        if blob.startswith(MAGIC_ENC):
-            if not self.enabled:
-                raise ValueError('received an encrypted item but no passphrase is set')
-            from cryptography.exceptions import InvalidTag
-            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-            body = blob[len(MAGIC_ENC):]
-            if len(body) < 16 + 12 + 16:
-                raise ValueError('truncated encrypted item')
-            salt, nonce, ct = body[:16], body[16:28], body[28:]
-            try:
-                return AESGCM(self._key(salt)).decrypt(nonce, ct, MAGIC_ENC + salt)
-            except InvalidTag:
-                raise ValueError('decryption failed (wrong passphrase or tampered data)') from None
-        if blob.startswith(MAGIC_PLAIN):
-            if self.enabled:
-                raise ValueError('rejected unencrypted item (a passphrase is configured)')
-            return blob[len(MAGIC_PLAIN):]
-        raise ValueError('not a ClipSend item')
-
-
-# --------------------------------------------------------------------------- #
-# message encoding / validation
+# device keys and end-to-end encryption
+#
+# Every device has its own key pair: Ed25519 (signing) + X25519 (encryption).
+# The public half is published next to the device's inbox; another device uses
+# it only after you confirmed its fingerprint (Devices… in the tray menu).
+# Each item is encrypted for one target (ephemeral X25519 + HKDF + AES-256-GCM)
+# and signed by the sender, so the server (or anyone with the storage login)
+# can neither read nor forge items.
 # --------------------------------------------------------------------------- #
 class Rejected(Exception):
     pass
 
 
+MAGIC = b'CLIPSEND/3\n'
+KEY_FILE = os.path.join(CONFIG_DIR, 'device_key.json')
+TRUST_FILE = os.path.join(CONFIG_DIR, 'trusted_devices.json')
+KEYRING_SERVICE = 'ClipSend'
+KEYRING_USER = 'device-key'
+MAX_BUNDLE = 2048
+
+
+def _raw_pub(k):
+    return k.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
+
+def _raw_priv(k):
+    return k.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                           serialization.NoEncryption())
+
+
+def _b64e(b):
+    return base64.b64encode(b).decode('ascii')
+
+
+def _b64d(s, n=None):
+    try:
+        b = base64.b64decode(s, validate=True)
+    except (ValueError, TypeError):
+        raise Rejected('bad base64') from None
+    if n is not None and len(b) != n:
+        raise Rejected('bad key length')
+    return b
+
+
+def _bundle_signed_part(device, sign_pub, enc_pub):
+    return b'clipsend-key-v1\n' + device.encode('ascii') + b'\n' + sign_pub + enc_pub
+
+
+class PeerKey:
+    """Public keys of a device."""
+
+    def __init__(self, sign_pub, enc_pub):
+        self.sign_pub, self.enc_pub = sign_pub, enc_pub
+        Ed25519PublicKey.from_public_bytes(sign_pub)       # validate
+        X25519PublicKey.from_public_bytes(enc_pub)
+
+    @property
+    def fingerprint(self):
+        h = hashlib.sha256(b'clipsend-fp-v1' + self.sign_pub + self.enc_pub).hexdigest()[:32].upper()
+        return ' '.join(h[i:i + 4] for i in range(0, 32, 4))
+
+    def verify(self, sig, data):
+        try:
+            Ed25519PublicKey.from_public_bytes(self.sign_pub).verify(sig, data)
+            return True
+        except InvalidSignature:
+            return False
+
+    def __eq__(self, other):
+        return isinstance(other, PeerKey) and (self.sign_pub, self.enc_pub) == (other.sign_pub, other.enc_pub)
+
+    def to_dict(self):
+        return {'sign': _b64e(self.sign_pub), 'enc': _b64e(self.enc_pub)}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(_b64d(d['sign'], 32), _b64d(d['enc'], 32))
+
+
+class DeviceKey:
+    """This device's private keys."""
+
+    def __init__(self, sign_sk, enc_sk):
+        self.sign_sk, self.enc_sk = sign_sk, enc_sk
+        self.public = PeerKey(_raw_pub(sign_sk.public_key()), _raw_pub(enc_sk.public_key()))
+
+    @classmethod
+    def generate(cls):
+        return cls(Ed25519PrivateKey.generate(), X25519PrivateKey.generate())
+
+    @classmethod
+    def from_raw(cls, raw):
+        if len(raw) != 64:
+            raise ValueError('bad key file')
+        return cls(Ed25519PrivateKey.from_private_bytes(raw[:32]), X25519PrivateKey.from_private_bytes(raw[32:]))
+
+    def raw(self):
+        return _raw_priv(self.sign_sk) + _raw_priv(self.enc_sk)
+
+    def bundle(self, device):
+        """Self-signed public key record that is published for the other devices."""
+        p = self.public
+        sig = self.sign_sk.sign(_bundle_signed_part(device, p.sign_pub, p.enc_pub))
+        return json.dumps({'v': 1, 'device': device, 'sign': _b64e(p.sign_pub), 'enc': _b64e(p.enc_pub),
+                           'sig': _b64e(sig)}, separators=(',', ':'))
+
+
+def parse_bundle(text, device):
+    """Published key record of `device` -> PeerKey. Raises Rejected if malformed or not self-signed."""
+    if not isinstance(text, str) or len(text) > MAX_BUNDLE:
+        raise Rejected('bad key record')
+    try:
+        d = json.loads(text)
+    except ValueError:
+        raise Rejected('bad key record') from None
+    if not isinstance(d, dict) or d.get('v') != 1 or d.get('device') != device:
+        raise Rejected('key record for another device')
+    try:
+        peer = PeerKey(_b64d(d.get('sign'), 32), _b64d(d.get('enc'), 32))
+    except ValueError:
+        raise Rejected('bad key') from None
+    if not peer.verify(_b64d(d.get('sig'), 64), _bundle_signed_part(device, peer.sign_pub, peer.enc_pub)):
+        raise Rejected('key record signature invalid')
+    return peer
+
+
+# ---- private key at rest: encrypted with a password (kept in the system keyring if possible) ----
+def _password_key(password, salt):
+    return Scrypt(salt=salt, length=32, n=2 ** 15, r=8, p=1).derive(password.encode('utf-8'))
+
+
+def save_device_key(key, password, path=None):
+    path = path or KEY_FILE
+    salt, nonce = os.urandom(16), os.urandom(12)
+    ct = AESGCM(_password_key(password, salt)).encrypt(nonce, key.raw(), b'clipsend-device-key-v1')
+    data = json.dumps({'v': 1, 'kdf': 'scrypt', 'salt': _b64e(salt), 'nonce': _b64e(nonce), 'key': _b64e(ct)})
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = f'{path}.tmp{os.getpid()}'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(data + '\n')
+    os.replace(tmp, path)
+
+
+def load_device_key(password, path=None):
+    """Raises ValueError('wrong password') or OSError."""
+    with open(path or KEY_FILE, encoding='utf-8') as f:
+        d = json.load(f)
+    try:
+        salt, nonce, ct = _b64d(d['salt'], 16), _b64d(d['nonce'], 12), _b64d(d['key'])
+    except (KeyError, Rejected):
+        raise ValueError('damaged key file') from None
+    try:
+        raw = AESGCM(_password_key(password, salt)).decrypt(nonce, ct, b'clipsend-device-key-v1')
+    except InvalidTag:
+        raise ValueError('wrong password') from None
+    return DeviceKey.from_raw(raw)
+
+
+def keyring_available():
+    try:
+        import keyring
+        from keyring.backends import fail
+        return not isinstance(keyring.get_keyring(), fail.Keyring)
+    except Exception:
+        return False
+
+
+def keyring_get():
+    try:
+        import keyring
+        return keyring.get_password(KEYRING_SERVICE, KEYRING_USER)
+    except Exception as e:
+        log.info('system keyring not usable: %s', e)
+        return None
+
+
+def keyring_set(password):
+    try:
+        import keyring
+        keyring.set_password(KEYRING_SERVICE, KEYRING_USER, password)
+        return True
+    except Exception as e:
+        log.warning('could not store the key password in the system keyring: %s', e)
+        return False
+
+
+def keyring_delete():
+    try:
+        import keyring
+        keyring.delete_password(KEYRING_SERVICE, KEYRING_USER)
+    except Exception:
+        pass
+
+
+# ---- confirmed devices ----
+class TrustStore:
+    """Devices whose fingerprint you confirmed. Thread safe; saved in TRUST_FILE."""
+
+    def __init__(self, path=None):
+        self.path = path or TRUST_FILE
+        self._lock = threading.Lock()
+        self._d = {}
+        try:
+            with open(self.path, encoding='utf-8') as f:
+                for dev, v in json.load(f).items():
+                    if DEVICE_RE.match(dev):
+                        self._d[dev] = PeerKey.from_dict(v)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, KeyError, TypeError, Rejected) as e:
+            log.error('could not read %s: %s', self.path, e)
+
+    def get(self, device):
+        with self._lock:
+            return self._d.get(device)
+
+    def devices(self):
+        with self._lock:
+            return sorted(self._d)
+
+    def set(self, device, peer):
+        with self._lock:
+            self._d[device] = peer
+            self._save()
+
+    def remove(self, device):
+        with self._lock:
+            self._d.pop(device, None)
+            self._save()
+
+    def _save(self):
+        os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
+        tmp = f'{self.path}.tmp{os.getpid()}'
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump({d: p.to_dict() for d, p in self._d.items()}, f, indent=2)
+        os.replace(tmp, self.path)
+
+
+# ---- sealing items ----
+def _item_key(shared, eph_pub, recipient_pub, sender, recipient):
+    info = b'clipsend-item-v3\n' + sender.encode() + b'\n' + recipient.encode()
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=eph_pub + recipient_pub, info=info).derive(shared)
+
+
+def seal(plain, my_key, sender, recipient, recipient_peer):
+    eph = X25519PrivateKey.generate()
+    eph_pub = _raw_pub(eph.public_key())
+    shared = eph.exchange(X25519PublicKey.from_public_bytes(recipient_peer.enc_pub))
+    key = _item_key(shared, eph_pub, recipient_peer.enc_pub, sender, recipient)
+    hdr = json.dumps({'from': sender, 'to': recipient, 'eph': _b64e(eph_pub)}, separators=(',', ':')).encode()
+    nonce = os.urandom(12)
+    head = MAGIC + struct.pack('>H', len(hdr)) + hdr + nonce
+    body = head + AESGCM(key).encrypt(nonce, plain, head)
+    return body + my_key.sign_sk.sign(body)
+
+
+def unseal(blob, my_key, me, trust):
+    """-> (sender, plaintext). Rejects anything not from a confirmed device, not for me, or tampered."""
+    if not blob.startswith(MAGIC):
+        raise Rejected('not a ClipSend item')
+    p = len(MAGIC)
+    if len(blob) < p + 2:
+        raise Rejected('truncated item')
+    (hlen,) = struct.unpack('>H', blob[p:p + 2])
+    if hlen > 1024 or len(blob) < p + 2 + hlen + 12 + 16 + 64:
+        raise Rejected('truncated item')
+    try:
+        hdr = json.loads(blob[p + 2:p + 2 + hlen])
+        sender, to, eph_pub = hdr['from'], hdr['to'], _b64d(hdr['eph'], 32)
+    except (ValueError, KeyError, TypeError):
+        raise Rejected('bad item header') from None
+    if not (isinstance(sender, str) and DEVICE_RE.match(sender)) or sender == me:
+        raise Rejected('bad sender')
+    if to != me:
+        raise Rejected(f'item addressed to {to!r}, not to this device')
+    peer = trust.get(sender)
+    if peer is None:
+        raise Rejected(f'item from {sender}, which is not confirmed: confirm it under Devices… first')
+    body, sig = blob[:-64], blob[-64:]
+    if not peer.verify(sig, body):
+        raise Rejected(f'item from {sender} has an invalid signature (its key changed? check Devices…)')
+    head_len = p + 2 + hlen + 12
+    head, nonce = body[:head_len], body[head_len - 12:head_len]
+    shared = my_key.enc_sk.exchange(X25519PublicKey.from_public_bytes(eph_pub))
+    key = _item_key(shared, eph_pub, my_key.public.enc_pub, sender, me)
+    try:
+        return sender, AESGCM(key).decrypt(nonce, body[head_len:], head)
+    except InvalidTag:
+        raise Rejected('could not decrypt the item') from None
+
+
+# --------------------------------------------------------------------------- #
+# message encoding / validation
+# --------------------------------------------------------------------------- #
 def wire_cap(max_bytes):
     """Upper bound for an encoded message (JSON, before/after compression) given a content limit."""
     return 2 * max_bytes + 256 * 1024
 
 
-def encode_message(msg, crypto, max_bytes):
+def encode_message(msg, my_key, recipient_peer, max_bytes):
     raw = json.dumps(msg, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
     if len(raw) > wire_cap(max_bytes):
         raise Rejected('content too large after encoding')
-    return crypto.seal(zlib.compress(raw, 6))
+    return seal(zlib.compress(raw, 6), my_key, msg['from'], msg['to'], recipient_peer)
 
 
-def decode_message(blob, crypto, max_bytes, me):
-    try:
-        comp = crypto.open(blob)
-    except ValueError as e:
-        raise Rejected(str(e)) from None
+def decode_message(blob, my_key, trust, max_bytes, me):
+    sender, comp = unseal(blob, my_key, me, trust)
     cap = wire_cap(max_bytes)
     d = zlib.decompressobj()
     try:
@@ -333,7 +579,10 @@ def decode_message(blob, crypto, max_bytes, me):
         msg = json.loads(raw.decode('utf-8'))
     except (UnicodeDecodeError, ValueError):
         raise Rejected('malformed item') from None
-    return validate_message(msg, max_bytes, me)
+    msg = validate_message(msg, max_bytes, me)
+    if msg['from'] != sender:
+        raise Rejected('sender mismatch')
+    return msg
 
 
 def _b64(s, budget):
@@ -347,7 +596,7 @@ def _b64(s, budget):
 
 
 def validate_message(msg, max_bytes, me):
-    if not isinstance(msg, dict) or msg.get('v') != 2:
+    if not isinstance(msg, dict) or msg.get('v') != 3:
         raise Rejected('unsupported item version')
     sender, to, ts, kind = msg.get('from'), msg.get('to'), msg.get('ts'), msg.get('kind')
     if not (isinstance(sender, str) and DEVICE_RE.match(sender)):
@@ -399,9 +648,22 @@ def validate_message(msg, max_bytes, me):
     return out
 
 
+_WIN_RESERVED = re.compile(r'^(con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]|lpt[0-9¹²³])(\..*)?$', re.I)
+
+
+def win_safe_component(part):
+    """Windows: no ':' (alternate data streams), no reserved device names, no trailing dots/spaces."""
+    part = re.sub(r'[<>:"|?*]', '_', part).rstrip(' .')
+    if _WIN_RESERVED.match(part):
+        part = '_' + part
+    return part
+
+
 def safe_component(part):
     part = unicodedata.normalize('NFC', _BAD_CHARS.sub('', part)).strip()
     part = part.replace('/', '_').replace('\\', '_')
+    if WINDOWS:
+        part = win_safe_component(part)
     if part in ('', '.', '..'):
         raise Rejected('unsafe path in file list')
     while len(part.encode('utf-8')) > 200:
@@ -419,6 +681,19 @@ def safe_relpath(path):
 
 
 _O_NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
+_O_BINARY = getattr(os, 'O_BINARY', 0)       # Windows: otherwise os.open() is in text mode
+
+
+def mark_of_the_web(path):
+    """Tag a received file as 'downloaded from the internet' so Windows (SmartScreen,
+    Office Protected View) warns before opening or running it."""
+    try:
+        with open(path + ':Zone.Identifier', 'w') as z:
+            z.write('[ZoneTransfer]\r\nZoneId=3\r\n')
+    except OSError:
+        pass        # e.g. FAT drives have no alternate data streams
+
+
 
 
 def write_received_files(files, download_dir, sender):
@@ -443,13 +718,13 @@ def write_received_files(files, download_dir, sender):
             raise Rejected('path escapes destination')
         parent = os.path.dirname(target)
         os.makedirs(parent, mode=0o755, exist_ok=True)
-        if os.path.realpath(parent) != os.path.abspath(parent):
+        if os.path.normcase(os.path.realpath(parent)) != os.path.normcase(os.path.abspath(parent)):
             raise Rejected('symlink in destination path')
         stem, ext = os.path.splitext(parts[-1])
         for n in range(1, 1000):
             try:
                 # O_EXCL + O_NOFOLLOW: never overwrite or follow anything; 0o644: never executable
-                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW, 0o644)
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_BINARY, 0o644)
                 break
             except FileExistsError:
                 target = os.path.join(parent, f'{stem} ({n + 1}){ext}')
@@ -457,6 +732,8 @@ def write_received_files(files, download_dir, sender):
             raise OSError('too many name collisions')
         with os.fdopen(fd, 'wb') as fh:
             fh.write(data)
+        if WINDOWS:
+            mark_of_the_web(target)
         total += len(data)
         first = os.path.join(dest, parts[0]) if len(parts) > 1 else target
         if first not in top:
@@ -491,7 +768,7 @@ def collect_files(paths, max_bytes):
                     if os.path.islink(fp) or not os.path.isfile(fp):
                         skipped += 1
                         continue
-                    # always '/' on the wire
+                    # always '/' on the wire (Windows would use '\\', which receivers reject)
                     add(fp, '/'.join([name] + os.path.relpath(fp, p).split(os.sep)))
         else:
             skipped += 1
@@ -541,6 +818,8 @@ class WebDav:
         self.auth = (user, password)
         self.root_path = f'{u.path}/remote.php/dav/files/{urllib.parse.quote(user, safe="")}'
         self.root = f'{u.scheme}://{u.netloc}{self.root_path}'
+        self.trash_root = (f'{u.scheme}://{u.netloc}{u.path}/remote.php/dav/trashbin/'
+                           f'{urllib.parse.quote(user, safe="")}/trash')
         self._local = threading.local()
 
     @property
@@ -567,9 +846,9 @@ class WebDav:
     def url(self, path):
         return self.root + urllib.parse.quote(path)
 
-    def _req(self, method, path, ok=(200, 201, 204, 207), stream=False, timeout=(10, 30), **kw):
-        r = self.s.request(method, self.url(path), timeout=timeout, allow_redirects=False,
-                           stream=stream, **kw)
+    def _req(self, method, path, ok=(200, 201, 204, 207), stream=False, timeout=(10, 30), base=None, **kw):
+        url = (base or self.root) + urllib.parse.quote(path)
+        r = self.s.request(method, url, timeout=timeout, allow_redirects=False, stream=stream, **kw)
         if r.status_code == 401:
             r.close()
             raise AuthError('authentication failed - check user / app password')
@@ -587,11 +866,11 @@ class WebDav:
                 raise Rejected(f'server response exceeds {human_size(cap)}')
         return bytes(buf)
 
-    def propfind(self, path, depth):
+    def propfind(self, path, depth, base=None):
         body = ('<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop>'
                 '<d:getetag/><d:getcontentlength/><d:resourcetype/></d:prop></d:propfind>')
         # short timeouts: a poll stuck on a dead connection would keep the state stale
-        r = self._req('PROPFIND', path, ok=(207, 404), stream=True, data=body, timeout=(6, 10),
+        r = self._req('PROPFIND', path, ok=(207, 404), stream=True, data=body, timeout=(6, 10), base=base,
                       headers={'Depth': str(depth), 'Content-Type': 'application/xml'})
         if r.status_code == 404:
             r.close()
@@ -635,11 +914,25 @@ class WebDav:
                   headers={'Content-Type': 'application/octet-stream'}).close()
 
     def get(self, path, cap):
-        r = self._req('GET', path, ok=(200,), stream=True)
+        r = self._req('GET', path, ok=(200, 404), stream=True)
+        if r.status_code == 404:
+            r.close()
+            return None
         return self._read_capped(r, cap)
 
     def delete(self, path):
         self._req('DELETE', path, ok=(204, 200, 404)).close()
+
+    def trash_names(self):
+        """Names in this account's trash bin ([] if the trash bin app is off)."""
+        try:
+            res = self.propfind('', 1, base=self.trash_root) or []
+        except DavError:
+            return []
+        return [e['name'] for e in res if not e['dir']]
+
+    def trash_delete(self, name):
+        self._req('DELETE', '/' + name, ok=(204, 200, 404), base=self.trash_root).close()
 
     def capabilities(self):
         r = self.s.get(f'{self.server}/ocs/v2.php/cloud/capabilities?format=json',
@@ -655,6 +948,385 @@ def norm_remote_dir(d):
     if any(p in ('.', '..') for p in parts):
         raise ValueError('remote folder must not contain . or ..')
     return '/' + '/'.join(parts) if parts else ''
+
+
+# --------------------------------------------------------------------------- #
+# transports: where the inboxes live (Nextcloud WebDAV or Firebase Realtime Database)
+# --------------------------------------------------------------------------- #
+class PushUnavailable(Exception):
+    """The backend offers no push channel: poll only."""
+
+
+TRASH_RE = re.compile(r'^\d{13}-[0-9a-f]{32}\.clipsend\.d\d+$')
+
+
+class NextcloudTransport:
+    """Inboxes are folders <remote_dir>/inbox/<device>/, items are files."""
+    kind = 'nextcloud'
+
+    def __init__(self, cfg):
+        self.dav = WebDav(cfg['server_url'], cfg['user'], cfg['app_password'])
+        self.requests = self.dav.requests
+        self.root = f'{norm_remote_dir(cfg["remote_dir"])}/inbox'
+        self.keys = f'{norm_remote_dir(cfg["remote_dir"])}/keys'
+        self._endpoint = None
+        self._ws = None
+
+    def _dir(self, device):
+        return f'{self.root}/{device}'
+
+    def register(self, me, bundle):
+        """Create my inbox and publish my public key record."""
+        self.dav.makedirs(self._dir(me))
+        self.dav.makedirs(self.keys)
+        self.dav.put(f'{self.keys}/{me}.json', bundle.encode('utf-8'))
+
+    def device_keys(self):
+        """{device: published key record (text)}"""
+        out = {}
+        for e in self.dav.listdir(self.keys) or []:
+            dev = e['name'][:-5] if e['name'].endswith('.json') else ''
+            if e['dir'] or not DEVICE_RE.match(dev):
+                continue
+            try:
+                data = self.dav.get(f'{self.keys}/{e["name"]}', MAX_BUNDLE)
+            except Rejected:
+                continue
+            if data is not None:
+                out[dev] = data.decode('utf-8', 'replace')
+        return out
+
+    def inbox_version(self, me):
+        """Changes whenever the inbox changes; None if the inbox is missing."""
+        return self.dav.etag(self._dir(me))
+
+    def list_items(self, device):
+        entries = self.dav.listdir(self._dir(device)) or []
+        return [{'name': e['name'], 'size': e['size']} for e in entries
+                if not e['dir'] and MSG_RE.match(e['name'])]
+
+    def fetch(self, device, name, cap):
+        """Item content, or None if it is gone."""
+        return self.dav.get(f'{self._dir(device)}/{name}', cap)
+
+    def put(self, device, name, blob):
+        self.dav.put(f'{self._dir(device)}/{name}', blob)
+
+    def delete(self, device, name):
+        self.dav.delete(f'{self._dir(device)}/{name}')
+
+    def devices(self):
+        entries = self.dav.listdir(self.root) or []
+        return [e['name'] for e in entries if e['dir'] and DEVICE_RE.match(e['name'])]
+
+    def purge_trash(self):
+        """Deleted files go to the Nextcloud trash bin (kept 30 days by default): remove ours."""
+        for name in self.dav.trash_names():
+            if TRASH_RE.match(name):
+                self.dav.trash_delete(name)
+
+    def reset(self):
+        self.dav.reset()
+
+    def test(self):
+        self.dav.makedirs(self.root)
+        devs = self.devices()
+        try:
+            push = bool((self.dav.capabilities().get('notify_push') or {}).get('endpoints'))
+        except Exception:
+            push = False
+        return devs, push
+
+    def watch(self, me, stop):
+        """Nextcloud notify_push websocket. Yields 'connected', then 'change' events."""
+        try:
+            import websocket   # websocket-client
+        except ImportError:
+            raise PushUnavailable('websocket-client not installed') from None
+        if self._endpoint is None:
+            caps = self.dav.capabilities()
+            endpoint = ((caps.get('notify_push') or {}).get('endpoints') or {}).get('websocket')
+            if not endpoint:
+                raise PushUnavailable('server has no notify_push app')
+            u = urllib.parse.urlsplit(endpoint)
+            if u.scheme != 'wss' and u.hostname not in ('localhost', '127.0.0.1'):
+                raise PushUnavailable(f'refusing non-TLS push endpoint {endpoint}')
+            if u.hostname != self.dav.host:
+                raise PushUnavailable(f'push endpoint on foreign host {u.hostname}: not sending credentials')
+            self._endpoint = endpoint
+        ws = websocket.create_connection(self._endpoint, timeout=30)
+        self._ws = ws
+        ws.send(self.dav.auth[0])
+        ws.send(self.dav.auth[1])
+        reply = ws.recv()
+        if reply != 'authenticated':
+            raise PushUnavailable(f'push login failed: {str(reply)[:100]!r}')
+        yield 'connected'
+        while not stop.is_set():
+            try:
+                m = ws.recv()
+            except websocket.WebSocketTimeoutException:
+                ws.ping()
+                continue
+            if isinstance(m, str) and m.startswith('notify_file'):
+                yield 'change'
+
+    def close_watch(self):
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+
+# ---- Firebase Realtime Database (REST API + server-sent events) ----
+FB_HOST_RE = re.compile(r'^[a-z0-9][a-z0-9-]*(\.[a-z0-9-]+)?\.(firebaseio\.com|firebasedatabase\.app)$')
+FB_API_KEY_RE = re.compile(r'^[A-Za-z0-9_-]{20,80}$')
+FB_UID_RE = re.compile(r'^[A-Za-z0-9]{1,128}$')
+FB_MAX_VALUE = 10 * 1024 * 1024 - 4096       # Realtime Database limit for one string value
+FB_MAX_MB = 6.0                              # transfer size that still fits after base64
+FB_SIGNIN_URL = 'https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword'
+FB_TOKEN_URL = 'https://securetoken.googleapis.com/v1/token'
+
+
+def check_firebase_url(url):
+    u = urllib.parse.urlsplit((url or '').strip().rstrip('/'))
+    if (u.scheme != 'https' or not u.hostname or not FB_HOST_RE.match(u.hostname)
+            or u.path not in ('', '/') or u.query or u.port):
+        raise ValueError('database URL must look like '
+                         'https://<project>-default-rtdb.europe-west1.firebasedatabase.app')
+    return f'https://{u.hostname}'
+
+
+def check_firebase_api_key(key):
+    if not FB_API_KEY_RE.match(key or ''):
+        raise ValueError('the Web API key looks wrong (Firebase console → Project settings → General)')
+    return key
+
+
+def _fb_error(r):
+    try:
+        return r.json()['error']['message']
+    except Exception:
+        return f'HTTP {r.status_code}'
+
+
+def firebase_sign_in(api_key, email, password):
+    """Email/password sign-in. Returns uid and a refresh token (the password is not kept)."""
+    import requests
+    check_firebase_api_key(api_key)
+    r = requests.post(FB_SIGNIN_URL, params={'key': api_key}, timeout=(10, 30), allow_redirects=False,
+                      json={'email': email, 'password': password, 'returnSecureToken': True},
+                      headers={'User-Agent': f'ClipSend/{VERSION}'})
+    if r.status_code != 200:
+        raise AuthError(f'Firebase sign-in failed: {_fb_error(r)}')
+    d = r.json()
+    if not FB_UID_RE.match(d.get('localId', '')) or not d.get('refreshToken'):
+        raise AuthError('Firebase sign-in returned an unexpected answer')
+    return {'uid': d['localId'], 'refresh_token': d['refreshToken']}
+
+
+class FirebaseAuth:
+    """Short-lived ID tokens (1 h) from the stored refresh token. Thread safe."""
+
+    def __init__(self, api_key, refresh_token, requests):
+        self.api_key = check_firebase_api_key(api_key)
+        self.refresh_token = refresh_token
+        self.requests = requests
+        self._lock = threading.Lock()
+        self._token = None
+        self._expires = 0.0
+
+    def token(self):
+        with self._lock:
+            if self._token is None or time.monotonic() > self._expires:
+                r = self.requests.post(FB_TOKEN_URL, params={'key': self.api_key}, timeout=(10, 30),
+                                       allow_redirects=False, headers={'User-Agent': f'ClipSend/{VERSION}'},
+                                       data={'grant_type': 'refresh_token', 'refresh_token': self.refresh_token})
+                if r.status_code in (400, 401, 403):
+                    raise AuthError(f'Firebase login expired or revoked ({_fb_error(r)}): '
+                                    'sign in again in the settings')
+                r.raise_for_status()
+                d = r.json()
+                self._token = d['id_token']
+                self._expires = time.monotonic() + int(d.get('expires_in', 3600)) - 300
+            return self._token
+
+    def invalidate(self):
+        with self._lock:
+            self._token = None
+
+
+def fb_key(device):
+    """Firebase keys must not contain '.', which device names may: use ',' (not allowed in names)."""
+    return device.replace('.', ',')
+
+
+def fb_unkey(key):
+    return key.replace(',', '.')
+
+
+class FirebaseTransport:
+    """Layout under users/<uid>/:  devices/<dev> = {seen, key},  inbox/<dev>/<ts-id> = base64 item,
+    signal/<dev> = time of the last item (the receiver streams this small node only)."""
+    kind = 'firebase'
+
+    def __init__(self, cfg):
+        import requests
+        self.requests = requests
+        self.db = check_firebase_url(cfg['fb_db_url'])
+        if not FB_UID_RE.match(cfg['fb_uid']):
+            raise ValueError('not signed in to Firebase: open the settings and sign in')
+        self.base = f'/users/{cfg["fb_uid"]}'
+        self.auth = FirebaseAuth(cfg['fb_api_key'], cfg['fb_refresh_token'], requests)
+        self._local = threading.local()
+        self._watch_resp = None
+
+    @property
+    def s(self):
+        s = getattr(self._local, 's', None)
+        if s is None:
+            s = self.requests.Session()
+            s.headers['User-Agent'] = f'ClipSend/{VERSION}'
+            s.max_redirects = 0
+            self._local.s = s
+        return s
+
+    def reset(self):
+        s = getattr(self._local, 's', None)
+        self._local.s = None
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    def _req(self, method, path, params=None, stream=False, timeout=(6, 15), **kw):
+        url = f'{self.db}{self.base}{path}.json'
+        for attempt in (1, 2):
+            p = dict(params or {}, auth=self.auth.token())
+            r = self.s.request(method, url, params=p, timeout=timeout, allow_redirects=False,
+                               stream=stream, **kw)
+            if r.status_code in (401, 403):
+                r.close()
+                self.auth.invalidate()          # token may just have expired: retry once
+                if attempt == 1:
+                    continue
+                raise AuthError('Firebase denied access: check the login and the database rules')
+            if r.status_code != 200:
+                r.close()
+                raise DavError(f'{method} {path}: HTTP {r.status_code}')
+            return r
+
+    def _json(self, method, path, cap=MAX_PROPFIND_BYTES, **kw):
+        r = self._req(method, path, stream=True, **kw)
+        buf = bytearray()
+        for chunk in r.iter_content(64 * 1024):
+            buf += chunk
+            if len(buf) > cap:
+                r.close()
+                raise Rejected(f'server response exceeds {human_size(cap)}')
+        return json.loads(bytes(buf) or b'null')
+
+    def _keys(self, path):
+        d = self._json('GET', path, params={'shallow': 'true'})
+        return sorted(d) if isinstance(d, dict) else []
+
+    @staticmethod
+    def _item_key(name):
+        m = MSG_RE.match(name)
+        if not m:
+            raise ValueError(f'bad item name {name!r}')
+        return f'{m.group(1)}-{m.group(2)}'
+
+    def register(self, me, bundle):
+        """Publish my public key record (the inbox node appears with the first item)."""
+        self._req('PUT', f'/devices/{fb_key(me)}', json={'seen': {'.sv': 'timestamp'}, 'key': bundle}).close()
+
+    def device_keys(self):
+        d = self._json('GET', '/devices')
+        out = {}
+        for k, v in (d.items() if isinstance(d, dict) else ()):
+            dev = fb_unkey(k)
+            if DEVICE_RE.match(dev) and isinstance(v, dict) and isinstance(v.get('key'), str):
+                out[dev] = v['key']
+        return out
+
+    def inbox_version(self, me):
+        return ','.join(self._keys(f'/inbox/{fb_key(me)}'))
+
+    def list_items(self, device):
+        return [{'name': f'{k}.clipsend', 'size': 0} for k in self._keys(f'/inbox/{fb_key(device)}')
+                if MSG_RE.match(f'{k}.clipsend')]
+
+    def fetch(self, device, name, cap):
+        v = self._json('GET', f'/inbox/{fb_key(device)}/{self._item_key(name)}', cap=cap * 4 // 3 + 64)
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            raise Rejected('malformed item')
+        try:
+            return base64.b64decode(v, validate=True)
+        except ValueError:
+            raise Rejected('malformed item') from None
+
+    def put(self, device, name, blob):
+        value = base64.b64encode(blob).decode('ascii')
+        if len(value) + 2 > FB_MAX_VALUE:
+            raise Rejected(f'too large for Firebase (at most about {FB_MAX_MB:g} MB per item)')
+        self._req('PUT', f'/inbox/{fb_key(device)}/{self._item_key(name)}', json=value,
+                  timeout=(10, 120)).close()
+        self._req('PUT', f'/signal/{fb_key(device)}', json={'.sv': 'timestamp'}).close()
+
+    def delete(self, device, name):
+        self._req('DELETE', f'/inbox/{fb_key(device)}/{self._item_key(name)}').close()
+
+    def devices(self):
+        return [d for d in map(fb_unkey, self._keys('/devices')) if DEVICE_RE.match(d)]
+
+    def purge_trash(self):
+        pass                                    # deleted Firebase data is gone
+
+    def test(self):
+        return self.devices(), True
+
+    def watch(self, me, stop):
+        """Server-sent events on signal/<me>. Yields 'connected', then 'change' events.
+        Firebase sends keep-alive every ~30 s; the read timeout catches dead connections."""
+        r = self._req('GET', f'/signal/{fb_key(me)}', stream=True, timeout=(10, 75),
+                      headers={'Accept': 'text/event-stream'})
+        self._watch_resp = r
+        event, connected = None, False
+        for raw in r.iter_lines(chunk_size=1):
+            if stop.is_set():
+                return
+            line = raw.decode('utf-8', 'replace')
+            if line.startswith('event:'):
+                event = line[6:].strip()
+            elif line.startswith('data:'):
+                if event in ('put', 'patch'):
+                    if not connected:
+                        connected = True
+                        yield 'connected'
+                    yield 'change'
+                elif event == 'auth_revoked':   # ID token expired (hourly): reconnect with a new one
+                    self.auth.invalidate()
+                    return
+                elif event == 'cancel':
+                    raise AuthError('Firebase cancelled the stream: check the database rules')
+
+    def close_watch(self):
+        r, self._watch_resp = self._watch_resp, None
+        if r is not None:
+            try:
+                r.close()
+            except Exception:
+                pass
+
+
+def make_transport(cfg):
+    return FirebaseTransport(cfg) if cfg['backend'] == 'firebase' else NextcloudTransport(cfg)
 
 
 # --------------------------------------------------------------------------- #
@@ -858,17 +1530,18 @@ class Engine(QtCore.QObject):
     status = Signal(str)             # short status for the tooltip
     devices_changed = Signal(object)
 
-    def __init__(self, cfg):
+    SWEEP_EVERY = 60.0               # s: delete expired items in all inboxes
+
+    def __init__(self, cfg, my_key, trust):
         super().__init__()
+        import requests
         self.cfg = cfg
         self.me = cfg['device_name']
         self.max_bytes = int(cfg['max_size_mb'] * 1024 * 1024)
-        self.base = norm_remote_dir(cfg['remote_dir'])
-        self.inbox_root = f'{self.base}/inbox'
-        self.inbox = f'{self.inbox_root}/{self.me}'
-        self.dav = WebDav(cfg['server_url'], cfg['user'], cfg['app_password'])
-        self._ssl_error = self.dav.requests.exceptions.SSLError
-        self.crypto = Crypto(cfg['passphrase'])
+        self.t = make_transport(cfg)
+        self._ssl_error = requests.exceptions.SSLError
+        self.my_key, self.trust = my_key, trust
+        self.peers = {}                  # device -> published PeerKey (None if the record is invalid)
         self.devices = []
         self.push_ok = False
         self._stop = threading.Event()
@@ -876,7 +1549,6 @@ class Engine(QtCore.QObject):
         self._send_lock = threading.Lock()
         self._status_lock = threading.Lock()
         self._last_status = None
-        self._ws = None
 
     # ---- lifecycle ----
     def start(self):
@@ -887,12 +1559,7 @@ class Engine(QtCore.QObject):
     def stop(self):
         self._stop.set()
         self._wake.set()
-        ws = self._ws
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                pass
+        self.t.close_watch()
 
     def wake(self):
         self._wake.set()
@@ -939,24 +1606,28 @@ class Engine(QtCore.QObject):
 
     # ---- receiving ----
     def _poll_loop(self):
-        last_etag, fails, next_dev_refresh = None, 0, 0.0
+        last_version, fails, next_dev_refresh, next_sweep = None, 0, 0.0, 0.0
         ready = False
         while not self._stop.is_set():
             delay = None
             try:
                 if not ready:
-                    self.dav.makedirs(self.inbox)
+                    self.t.register(self.me, self.my_key.bundle(self.me))
                     ready = True
                 if self.cfg['receive_enabled']:
-                    etag = self.dav.etag(self.inbox)
-                    if etag is None:
+                    version = self.t.inbox_version(self.me)
+                    if version is None:
                         ready = False
-                    elif etag != last_etag:
+                    elif version != last_version:
                         self._process_inbox()
-                        last_etag = etag
-                if time.monotonic() >= next_dev_refresh:
+                        last_version = version
+                now = time.monotonic()
+                if now >= next_dev_refresh:
                     self.refresh_devices()
-                    next_dev_refresh = time.monotonic() + 60
+                    next_dev_refresh = now + 60
+                if now >= next_sweep:
+                    self._sweep()
+                    next_sweep = now + self.SWEEP_EVERY
                 fails = 0
                 self._mark_ok()
             except AuthError as e:
@@ -966,7 +1637,7 @@ class Engine(QtCore.QObject):
                 delay = 600.0         # do not hammer the server (brute-force lockout)
             except self._ssl_error as e:
                 # e.g. a firewall that intercepts HTTPS: never bypass, and do not retry every few seconds
-                self.dav.reset()
+                self.t.reset()
                 if self._last_status != 'certificate error':
                     log.warning('TLS error, pausing for 10 min: %s', e)
                     self._emit(self.error, 'ClipSend: connection not trusted', CERT_HINT)
@@ -977,7 +1648,7 @@ class Engine(QtCore.QObject):
                 log.warning('poll error: %s', e)
                 # pooled keep-alive connections are dead after suspend / network change and
                 # can stay broken: always reconnect from scratch
-                self.dav.reset()
+                self.t.reset()
                 if fails == 1:
                     delay = 0.3       # usually just a stale connection: retry at once, keep the state
                 else:
@@ -987,39 +1658,39 @@ class Engine(QtCore.QObject):
                 delay = 30.0 if self.push_ok else self.cfg['poll_interval']
             if self._sleep(delay):
                 fails = min(fails, 1)  # resumed: retry quickly instead of waiting out the backoff
-                self.dav.reset()
+                self.t.reset()
 
     def _process_inbox(self):
-        entries = self.dav.listdir(self.inbox) or []
-        msgs = sorted((e for e in entries if not e['dir'] and MSG_RE.match(e['name'])),
-                      key=lambda e: e['name'])[:MAX_BATCH]
-        if not msgs:
+        items = sorted(self.t.list_items(self.me), key=lambda e: e['name'])[:MAX_BATCH]
+        if not items:
             return
         self._emit(self.receiving, True)
         try:
-            self._process_items(msgs)
+            self._process_items(items)
         finally:
             self._emit(self.receiving, False)
 
-    def _process_items(self, msgs):
+    def _process_items(self, items):
         cap = wire_cap(self.max_bytes)
-        for e in msgs:
+        for e in items:
             if self._stop.is_set():
                 return
-            path = f'{self.inbox}/{e["name"]}'
+            name = e['name']
             try:
                 if e['size'] > cap:
                     raise Rejected(f'item too large ({human_size(e["size"])})')
                 # network errors propagate to the poll loop (item stays for the next attempt)
-                blob = self.dav.get(path, cap)
+                blob = self.t.fetch(self.me, name, cap)
             except Rejected as ex:
-                log.warning('rejected %s: %s', e['name'], ex)
+                log.warning('rejected %s: %s', name, ex)
                 self._emit(self.error, 'ClipSend: rejected incoming item', clean_display(str(ex), 300))
-                self._delete_quietly(path)
+                self._delete_quietly(self.me, name)
                 continue
-            self._delete_quietly(path)
+            if blob is None:            # already gone (e.g. expired and swept)
+                continue
+            self._delete_quietly(self.me, name)    # read successfully: remove it from the server
             try:
-                msg = decode_message(blob, self.crypto, self.max_bytes, self.me)
+                msg = decode_message(blob, self.my_key, self.trust, self.max_bytes, self.me)
                 age = time.time() - msg['ts']
                 if abs(age) > self.cfg['max_age_min'] * 60:
                     log.info('discarding stale item from %s (%.0f min old)', msg['from'], age / 60)
@@ -1031,88 +1702,79 @@ class Engine(QtCore.QObject):
                 log.info('received %s from %s', msg['kind'], msg['from'])
                 self._emit(self.received, msg)
             except Rejected as ex:
-                log.warning('rejected %s: %s', e['name'], ex)
+                log.warning('rejected %s: %s', name, ex)
                 self._emit(self.error, 'ClipSend: rejected incoming item', clean_display(str(ex), 300))
             except OSError as ex:      # writing files failed
-                log.warning('failed to process %s: %s', e['name'], ex)
+                log.warning('failed to process %s: %s', name, ex)
                 self._emit(self.error, 'ClipSend: receive failed', clean_display(str(ex), 300))
 
-    def _delete_quietly(self, path):
+    def _delete_quietly(self, device, name):
         try:
-            self.dav.delete(path)
+            self.t.delete(device, name)
         except Exception as ex:
-            log.warning('could not delete %s: %s', path, ex)
+            log.warning('could not delete %s/%s: %s', device, name, ex)
+
+    def _sweep(self):
+        """Delete items older than max_age from every inbox, also those of devices that are off,
+        so nothing stays on the server for long even if the receiver never picks it up."""
+        cutoff_ms = (time.time() - self.cfg['max_age_min'] * 60) * 1000
+        for dev in sorted(set(self.t.devices()) | {self.me}):
+            for e in self.t.list_items(dev):
+                m = MSG_RE.match(e['name'])
+                if m and int(m.group(1)) < cutoff_ms:
+                    log.info('deleting expired item for %s', dev)
+                    self._delete_quietly(dev, e['name'])
+        self.t.purge_trash()
 
     def refresh_devices(self):
-        entries = self.dav.listdir(self.inbox_root) or []
-        devs = sorted(e['name'] for e in entries
-                      if e['dir'] and DEVICE_RE.match(e['name']) and e['name'] != self.me)
-        if devs != self.devices:
-            self.devices = devs
-            self._emit(self.devices_changed, list(devs))
-        return devs
-
-    # ---- push (Nextcloud notify_push) ----
-    def _push_loop(self):
-        try:
-            import websocket   # websocket-client
-        except ImportError:
-            log.info('websocket-client not installed: polling only')
-            return
-        backoff = 5
-        endpoint = None
-        while not self._stop.is_set():
+        """Read the published keys of all devices. Using one still needs your confirmation."""
+        peers = {}
+        for dev, text in self.t.device_keys().items():
+            if dev == self.me:
+                continue
             try:
-                if endpoint is None:
-                    caps = self.dav.capabilities()
-                    endpoint = ((caps.get('notify_push') or {}).get('endpoints') or {}).get('websocket')
-                    if not endpoint:
-                        log.info('server has no notify_push app: polling every %.1fs', self.cfg['poll_interval'])
-                        return
-                    u = urllib.parse.urlsplit(endpoint)
-                    if u.scheme != 'wss' and u.hostname not in ('localhost', '127.0.0.1'):
-                        log.warning('refusing non-TLS push endpoint %s', endpoint)
-                        return
-                    if u.hostname != self.dav.host:
-                        log.warning('push endpoint on foreign host %s - not sending credentials', u.hostname)
-                        return
-                ws = websocket.create_connection(endpoint, timeout=30)
-                self._ws = ws
-                ws.send(self.dav.auth[0])
-                ws.send(self.dav.auth[1])
-                reply = ws.recv()
-                if reply != 'authenticated':
-                    log.warning('push auth failed: %r', str(reply)[:100])
-                    return
-                log.info('push connected (%s)', endpoint)
-                self.push_ok = True
-                self._mark_ok()
-                self._wake.set()          # check once right away
-                backoff = 5
-                while not self._stop.is_set():
-                    try:
-                        m = ws.recv()
-                    except websocket.WebSocketTimeoutException:
-                        ws.ping()
-                        continue
-                    if isinstance(m, str) and m.startswith('notify_file'):
-                        self._wake.set()
+                peers[dev] = parse_bundle(text, dev)
+            except Rejected as e:
+                log.warning('ignoring key record of %s: %s', dev, e)
+                peers[dev] = None
+        changed = peers != self.peers
+        self.peers, self.devices = peers, sorted(peers)
+        if changed:
+            self._emit(self.devices_changed, dict(peers))
+        return self.devices
+
+    # ---- push (Nextcloud notify_push / Firebase event stream) ----
+    def _push_loop(self):
+        backoff = 5
+        while not self._stop.is_set():
+            clean_end = False
+            try:
+                for ev in self.t.watch(self.me, self._stop):
+                    if ev == 'connected':
+                        log.info('push connected (%s)', self.t.kind)
+                        self.push_ok = True
+                        self._mark_ok()
+                        backoff = 5
+                    self._wake.set()      # check the inbox now
+                clean_end = True
+            except PushUnavailable as e:
+                log.info('%s: polling every %.1fs', e, self.cfg['poll_interval'])
+                return
             except Exception as e:
                 if self._stop.is_set():
                     break
-                if isinstance(e, self._ssl_error) or 'CERTIFICATE_VERIFY_FAILED' in str(e):
-                    backoff = 600     # untrusted certificate (see CERT_HINT): no fast retries
+                if isinstance(e, (AuthError, self._ssl_error)) or 'CERTIFICATE_VERIFY_FAILED' in str(e):
+                    backoff = 600     # wrong login / untrusted certificate: no fast retries
                 log.info('push connection lost (%s), reconnect in %ss', e, backoff)
             finally:
                 if self.push_ok:
                     self.push_ok = False
                     self._wake.set()      # poll right away; it updates the state
-                if self._ws is not None:
-                    try:
-                        self._ws.close()
-                    except Exception:
-                        pass
-                    self._ws = None
+                self.t.close_watch()
+                self.t.reset()
+            if clean_end:             # e.g. hourly token renewal: reconnect at once
+                self._stop.wait(1)
+                continue
             self._stop.wait(backoff)
             backoff = min(300, backoff * 2)
 
@@ -1126,7 +1788,7 @@ class Engine(QtCore.QObject):
     def _send(self, content, target):
         try:
             kind = content['kind']
-            msg = {'v': 2, 'from': self.me, 'kind': kind}
+            msg = {'v': 3, 'from': self.me, 'kind': kind}
             if kind == 'text':
                 if len(content['text'].encode('utf-8', 'surrogatepass')) > self.max_bytes:
                     raise Rejected(f'text is larger than the limit ({human_size(self.max_bytes)})')
@@ -1146,19 +1808,31 @@ class Engine(QtCore.QObject):
             else:
                 raise Rejected('clipboard is empty')
 
+            self.refresh_devices()
             if target and target != '*':
-                targets = [target]
+                candidates = [target]
             else:
-                targets = self.refresh_devices()
+                candidates = sorted(set(self.devices) | set(self.trust.devices()))
+            targets, problems, unconfirmed = [], [], 0
+            for t in candidates:
+                pinned, published = self.trust.get(t), self.peers.get(t)
+                if pinned is None:
+                    unconfirmed += 1
+                    problems.append(f'{t} is not confirmed yet (tray menu: Devices…)')
+                elif published is not None and published != pinned:
+                    problems.append(f'{t} has a new key: check and confirm it again under Devices…')
+                elif t in self.devices or target == t:
+                    targets.append(t)
             if not targets:
-                raise Rejected('no other device found - start ClipSend on the other machine first')
+                raise Rejected('; '.join(problems) or 'no other device found - start ClipSend on the other '
+                               'machine and confirm it under Devices…')
+            if unconfirmed and target in (None, '', '*'):
+                summary += f' ({unconfirmed} unconfirmed device{"s" if unconfirmed != 1 else ""} skipped)'
             for t in targets:
                 msg.update(to=t, ts=time.time(), id=uuid.uuid4().hex)
-                blob = encode_message(msg, self.crypto, self.max_bytes)
+                blob = encode_message(msg, self.my_key, self.trust.get(t), self.max_bytes)
                 name = f'{int(msg["ts"] * 1000):013d}-{msg["id"]}.clipsend'
-                tdir = f'{self.inbox_root}/{t}'
-                self._cleanup_stale(tdir)
-                self.dav.put(f'{tdir}/{name}', blob)
+                self.t.put(t, name, blob)
                 log.info('sent %s to %s (%s on the wire)', kind, t, human_size(len(blob)))
             self._mark_ok()
             self._emit(self.sent, f'{summary} → {", ".join(targets)}')
@@ -1174,33 +1848,14 @@ class Engine(QtCore.QObject):
             self._emit(self.error, 'ClipSend: send failed', clean_display(f'{type(e).__name__}: {e}', 300))
             self._wake.set()          # let the poll loop re-check the connection
         finally:
-            self.dav.reset()          # this thread ends; do not leak its connections
+            self.t.reset()            # this thread ends; do not leak its connections
             self._send_lock.release()
-
-    def _cleanup_stale(self, tdir):
-        """Delete items nobody picked up (e.g. device offline) so inboxes cannot grow forever."""
-        try:
-            entries = self.dav.listdir(tdir) or []
-        except DavError:
-            return
-        cutoff = (time.time() - self.cfg['max_age_min'] * 60) * 1000
-        for e in entries:
-            m = MSG_RE.match(e['name'])
-            if m and int(m.group(1)) < cutoff:
-                self.dav.delete(f'{tdir}/{e["name"]}')
 
     # ---- used by the settings dialog ----
     @staticmethod
     def test_connection(cfg):
-        dav = WebDav(cfg['server_url'], cfg['user'], cfg['app_password'])
-        base = norm_remote_dir(cfg['remote_dir'])
-        dav.makedirs(f'{base}/inbox')
-        devs = [e['name'] for e in (dav.listdir(f'{base}/inbox') or []) if e['dir']]
-        try:
-            push = bool((dav.capabilities().get('notify_push') or {}).get('endpoints'))
-        except Exception:
-            push = False
-        return devs, push
+        """Returns (registered devices, push available)."""
+        return make_transport(cfg).test()
 
 
 # --------------------------------------------------------------------------- #
@@ -1211,6 +1866,64 @@ COMMANDS = ('send', 'settings', 'quit', 'ping')
 
 def sock_path():
     return os.path.join(runtime_dir(), f'{APP}.sock')
+
+
+def pipe_name():
+    import getpass
+    return 'clipsend-' + re.sub(r'[^A-Za-z0-9_.-]', '_', getpass.getuser())
+
+
+class WinControlServer(QtCore.QObject):
+    """Windows: named pipe via QLocalServer, restricted to the current user."""
+    command = Signal(str)
+
+    def start(self):
+        from importlib import import_module
+        QtNetwork = import_module(f'{QT_API}.QtNetwork')
+        self.server = QtNetwork.QLocalServer(self)
+        self.server.setSocketOptions(qenum(QtNetwork.QLocalServer, 'SocketOption', 'UserAccessOption'))
+        QtNetwork.QLocalServer.removeServer(pipe_name())
+        if not self.server.listen(pipe_name()):
+            raise OSError(f'cannot listen on control pipe: {self.server.errorString()}')
+        self.server.newConnection.connect(self._new_connection)
+
+    def _new_connection(self):
+        while self.server.hasPendingConnections():
+            conn = self.server.nextPendingConnection()
+            conn.readyRead.connect(lambda c=conn: self._read(c))
+            conn.disconnected.connect(conn.deleteLater)
+            if conn.bytesAvailable():       # data may have arrived before readyRead was connected
+                self._read(conn)
+
+    def _read(self, conn):
+        if not conn.canReadLine():
+            if conn.bytesAvailable() > 64:
+                conn.abort()
+            return
+        cmd = bytes(conn.readLine(64)).decode('ascii', 'ignore').strip()
+        conn.write(b'ok\n' if cmd in COMMANDS else b'unknown command\n')
+        conn.flush()
+        if cmd in COMMANDS and cmd != 'ping':
+            QtCore.QTimer.singleShot(50, lambda: self.command.emit(cmd))
+
+    def close(self):
+        self.server.close()
+
+
+def win_send_command(cmd):
+    from importlib import import_module
+    QtNetwork = import_module(f'{QT_API}.QtNetwork')
+    if QtCore.QCoreApplication.instance() is None:
+        win_send_command._app = QtCore.QCoreApplication([])
+    s = QtNetwork.QLocalSocket()
+    s.connectToServer(pipe_name())
+    if not s.waitForConnected(2000):
+        return False
+    s.write(cmd.encode() + b'\n')
+    s.waitForBytesWritten(1000)
+    if not s.waitForReadyRead(3000):
+        return False
+    return bytes(s.readAll()).strip() == b'ok'
 
 
 class ControlServer(QtCore.QObject):
@@ -1263,6 +1976,8 @@ class ControlServer(QtCore.QObject):
 
 
 def send_command(cmd):
+    if WINDOWS:
+        return win_send_command(cmd)
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(3)
@@ -1288,6 +2003,13 @@ def wait_for_exit(timeout=15.0):
 def acquire_lock():
     path = os.path.join(runtime_dir(), f'{APP}.lock')
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    if WINDOWS:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            os.close(fd)
+            return None
+        return fd
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as e:
@@ -1296,6 +2018,193 @@ def acquire_lock():
             return None
         raise
     return fd
+
+
+# --------------------------------------------------------------------------- #
+# devices dialog: confirm other devices by comparing fingerprints (manual)
+# --------------------------------------------------------------------------- #
+def device_status(dev, published, pinned):
+    """(status text, usable) for a device, from its published key and the confirmed one."""
+    if pinned is not None:
+        if published is not None and published != pinned:
+            return 'KEY CHANGED - blocked until confirmed again', False
+        return 'confirmed', True
+    if published is None:
+        return 'invalid key record', False
+    return 'new - not confirmed', False
+
+
+def pending_devices(peers, trust):
+    """Devices with a valid published key that is not (or no longer) confirmed."""
+    return sorted(d for d, p in peers.items() if p is not None and trust.get(d) != p)
+
+
+def device_prompt_text(dev, pub, pinned, me, my_pub):
+    """Text of the popup that asks whether to accept a new (or changed) device key."""
+    if pinned is not None:
+        head = (f'The key of "{dev}" has CHANGED. Until you accept the new key, nothing is sent to or '
+                f'accepted from "{dev}".\n\nAccept it only if you made a new key on "{dev}" yourself '
+                '(or reinstalled it).')
+    else:
+        head = f'"{dev}" wants to exchange clipboards with this device.'
+    return (f'{head}\n\n'
+            f'Fingerprint of "{dev}":\n    {pub.fingerprint}\n\n'
+            f'Fingerprint of this device ("{me}"):\n    {my_pub.fingerprint}\n\n'
+            f'Check that "{dev}" shows the same two fingerprints, the other way round. Accept only if '
+            'they match. You can also do this later under Devices… in the tray menu.')
+
+
+class DevicesDialog(QtWidgets.QDialog):
+    def __init__(self, me, my_key, peers, trust, parent=None):
+        super().__init__(parent)
+        W = QtWidgets
+        self.setWindowTitle('ClipSend Devices')
+        self.setWindowIcon(app_icon())
+        self.setMinimumWidth(640)
+        self.peers, self.trust = peers, trust
+        self.new_key_requested = False
+        lay = W.QVBoxLayout(self)
+
+        mine = W.QLabel(f'This device: <b>{html.escape(me)}</b><br>'
+                        f'Fingerprint: <tt>{my_key.public.fingerprint if my_key else "(locked)"}</tt>')
+        mine.setTextInteractionFlags(qenum(QtCore.Qt, 'TextInteractionFlag', 'TextSelectableByMouse'))
+        lay.addWidget(mine)
+        hint = W.QLabel('Confirm a device only after checking that the fingerprint shown here is exactly '
+                        'the one that device shows for itself in its own Devices window. ClipSend sends '
+                        'nothing to unconfirmed devices and rejects everything they send.')
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        self.table = W.QTreeWidget()
+        self.table.setHeaderLabels(['Device', 'Fingerprint', 'Status'])
+        self.table.setRootIsDecorated(False)
+        lay.addWidget(self.table)
+
+        row = W.QHBoxLayout()
+        self.btn_confirm = W.QPushButton('Confirm…')
+        self.btn_confirm.clicked.connect(self._confirm)
+        self.btn_remove = W.QPushButton('Remove confirmation')
+        self.btn_remove.clicked.connect(self._remove)
+        newkey = W.QPushButton('New key for this device…')
+        newkey.clicked.connect(self._new_key)
+        close = W.QPushButton('Close')
+        close.clicked.connect(self.accept)
+        row.addWidget(self.btn_confirm)
+        row.addWidget(self.btn_remove)
+        row.addStretch(1)
+        row.addWidget(newkey)
+        row.addWidget(close)
+        lay.addLayout(row)
+        self.table.itemSelectionChanged.connect(self._update_buttons)
+        self._fill()
+
+    def _fill(self):
+        self.table.clear()
+        for dev in sorted(set(self.peers) | set(self.trust.devices())):
+            pub, pinned = self.peers.get(dev), self.trust.get(dev)
+            status, _ = device_status(dev, pub, pinned)
+            if dev not in self.peers:
+                status += ' (no key published right now)'
+            fp = (pub or pinned).fingerprint if (pub or pinned) else ''
+            item = QtWidgets.QTreeWidgetItem([dev, fp, status])
+            item.setData(0, qenum(QtCore.Qt, 'ItemDataRole', 'UserRole'), dev)
+            self.table.addTopLevelItem(item)
+        for i in range(3):
+            self.table.resizeColumnToContents(i)
+        self._update_buttons()
+
+    def _selected(self):
+        items = self.table.selectedItems()
+        return items[0].data(0, qenum(QtCore.Qt, 'ItemDataRole', 'UserRole')) if items else None
+
+    def _update_buttons(self):
+        dev = self._selected()
+        pub = self.peers.get(dev) if dev else None
+        self.btn_confirm.setEnabled(bool(dev) and pub is not None and self.trust.get(dev) != pub)
+        self.btn_remove.setEnabled(bool(dev) and self.trust.get(dev) is not None)
+
+    def _confirm(self):
+        dev = self._selected()
+        pub = self.peers.get(dev)
+        if not dev or pub is None:
+            return
+        W = QtWidgets.QMessageBox
+        ans = W.question(self, 'Confirm device',
+                         f'On "{dev}", open Devices… and check that it shows exactly this fingerprint '
+                         f'for itself:\n\n{pub.fingerprint}\n\nConfirm only if they match. Do they match?')
+        if ans == qenum(W, 'StandardButton', 'Yes'):
+            self.trust.set(dev, pub)
+            log.info('confirmed device %s (%s)', dev, pub.fingerprint)
+            self._fill()
+
+    def _remove(self):
+        dev = self._selected()
+        if dev:
+            self.trust.remove(dev)
+            log.info('removed confirmation of %s', dev)
+            self._fill()
+
+    def _new_key(self):
+        W = QtWidgets.QMessageBox
+        ans = W.question(self, 'New key',
+                         'Create a new key for this device?\n\nAll other devices will block this device '
+                         'until you confirm it there again.')
+        if ans == qenum(W, 'StandardButton', 'Yes'):
+            self.new_key_requested = True
+            self.accept()
+
+
+def ask_password(parent, title, label):
+    W = QtWidgets
+    pw, ok = W.QInputDialog.getText(parent, title, label, qenum(W.QLineEdit, 'EchoMode', 'Password'))
+    return pw if ok else None
+
+
+def ask_new_password(parent, reason):
+    while True:
+        pw = ask_password(parent, 'ClipSend: protect the device key',
+                          f'{reason}\n'
+                          'Choose a password for this device\'s key. You will enter it when ClipSend starts.\n'
+                          'At least 8 characters:')
+        if pw is None:
+            return None
+        if len(pw) < 8:
+            QtWidgets.QMessageBox.warning(parent, 'ClipSend', 'Use at least 8 characters.')
+            continue
+        if ask_password(parent, 'ClipSend: protect the device key', 'Repeat the password:') != pw:
+            QtWidgets.QMessageBox.warning(parent, 'ClipSend', 'The passwords differ.')
+            continue
+        return pw
+
+
+# --------------------------------------------------------------------------- #
+# Windows: start at login via a visible launcher in the user's Startup folder
+# (no registry changes, no installer; plain Python)
+# --------------------------------------------------------------------------- #
+def startup_launcher_path():
+    return os.path.join(os.environ.get('APPDATA', ''), 'Microsoft', 'Windows', 'Start Menu', 'Programs',
+                        'Startup', 'ClipSend.pyw')
+
+
+def get_autostart():
+    return WINDOWS and os.path.exists(startup_launcher_path())
+
+
+def set_autostart(on):
+    path = startup_launcher_path()
+    if on:
+        script = os.path.abspath(__file__)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('# Starts ClipSend when you log in. Created by ClipSend (Settings: Start at login).\n'
+                    '# Delete this file, or untick the setting, to stop that.\n'
+                    'import runpy, sys\n'
+                    f'sys.argv = [{script!r}]\n'
+                    f'runpy.run_path({script!r}, run_name="__main__")\n')
+    else:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -1311,8 +2220,21 @@ class SettingsDialog(QtWidgets.QDialog):
         W = QtWidgets
         lay = W.QVBoxLayout(self)
 
-        # connection
-        g = W.QGroupBox('Nextcloud connection')
+        # backend
+        row = W.QHBoxLayout()
+        self.backend = W.QComboBox()
+        self.backend.addItem('Nextcloud (WebDAV)', 'nextcloud')
+        self.backend.addItem('Google Firebase (Realtime Database)', 'firebase')
+        self.backend.setCurrentIndex(max(0, self.backend.findData(cfg['backend'])))
+        test = W.QPushButton('Test connection')
+        test.clicked.connect(self._test)
+        row.addWidget(W.QLabel('Storage'))
+        row.addWidget(self.backend, 1)
+        row.addWidget(test)
+        lay.addLayout(row)
+
+        # connection: Nextcloud
+        g = self.nc_group = W.QGroupBox('Nextcloud connection')
         f = W.QFormLayout(g)
         self.url = W.QLineEdit(cfg['server_url'])
         self.url.setPlaceholderText('https://cloud.example.com')
@@ -1321,14 +2243,31 @@ class SettingsDialog(QtWidgets.QDialog):
         self.pw.setEchoMode(qenum(W.QLineEdit, 'EchoMode', 'Password'))
         self.pw.setToolTip('Use an app password (Nextcloud → Settings → Security), ideally of a dedicated account.')
         self.rdir = W.QLineEdit(cfg['remote_dir'])
-        test = W.QPushButton('Test connection')
-        test.clicked.connect(self._test)
         f.addRow('Server URL', self.url)
         f.addRow('User', self.user)
         f.addRow('App password', self.pw)
         f.addRow('Remote folder', self.rdir)
-        f.addRow('', test)
         lay.addWidget(g)
+
+        # connection: Firebase
+        g = self.fb_group = W.QGroupBox('Firebase connection')
+        f = W.QFormLayout(g)
+        self.fb_url = W.QLineEdit(cfg['fb_db_url'])
+        self.fb_url.setPlaceholderText('https://<project>-default-rtdb.europe-west1.firebasedatabase.app')
+        self.fb_key = W.QLineEdit(cfg['fb_api_key'])
+        self.fb_key.setToolTip('Firebase console → Project settings → General → Web API key')
+        self.fb_email = W.QLineEdit(cfg['fb_email'])
+        self.fb_pw = W.QLineEdit()
+        self.fb_pw.setEchoMode(qenum(W.QLineEdit, 'EchoMode', 'Password'))
+        self.fb_pw.setPlaceholderText('signed in - leave empty to keep' if cfg['fb_refresh_token']
+                                      else 'needed once to sign in; it is not stored')
+        f.addRow('Database URL', self.fb_url)
+        f.addRow('Web API key', self.fb_key)
+        f.addRow('Email', self.fb_email)
+        f.addRow('Password', self.fb_pw)
+        lay.addWidget(g)
+        self.backend.currentIndexChanged.connect(self._show_backend)
+        self._show_backend()
 
         # device & sending
         g = W.QGroupBox('Sending')
@@ -1375,7 +2314,7 @@ class SettingsDialog(QtWidgets.QDialog):
         b.clicked.connect(self._browse)
         row.addWidget(self.ddir)
         row.addWidget(b)
-        self.push = W.QCheckBox('Use instant push if the server supports it (notify_push)')
+        self.push = W.QCheckBox('Use instant push when available (Firebase, or Nextcloud with notify_push)')
         self.push.setChecked(cfg['use_push'])
         self.poll = W.QDoubleSpinBox()
         self.poll.setRange(0.5, 300)
@@ -1388,27 +2327,36 @@ class SettingsDialog(QtWidgets.QDialog):
         self.age.setValue(cfg['max_age_min'])
         f.addRow(self.recv)
         f.addRow(self.apply)
-        f.addRow(self.selection)
+        if not WINDOWS:             # Windows has no primary selection
+            f.addRow(self.selection)
         f.addRow('Save received files to', row)
         f.addRow(self.push)
         f.addRow('Poll interval (no push)', self.poll)
         f.addRow('Discard items older than', self.age)
         lay.addWidget(g)
 
-        # security
-        g = W.QGroupBox('Security')
+        # security & startup
+        g = W.QGroupBox('Security and startup')
         f = W.QFormLayout(g)
-        self.pp = W.QLineEdit(cfg['passphrase'])
-        self.pp.setEchoMode(qenum(W.QLineEdit, 'EchoMode', 'Password'))
-        self.pp.setPlaceholderText('empty = no end-to-end encryption')
-        self.pp.setToolTip('Same passphrase on all devices. Content is encrypted (AES-GCM) before upload, '
-                           'and anything not encrypted with it is rejected.')
+        store = 'Windows Credential Manager' if WINDOWS else 'KWallet (system keyring)'
+        self.use_keyring = W.QCheckBox(f"Keep the password of this device's key in {store}")
+        self.use_keyring.setToolTip('Then ClipSend starts without asking for a password. Otherwise you enter '
+                                    'it each time ClipSend starts.')
+        self.use_keyring.setChecked(cfg['use_keyring'])
+        if not keyring_available():
+            self.use_keyring.setEnabled(False)
+            self.use_keyring.setToolTip('Not available: install the Python package "keyring".')
+        f.addRow(self.use_keyring)
+        self.autostart = None
+        if WINDOWS:
+            self.autostart = W.QCheckBox('Start ClipSend when I log in (puts ClipSend.pyw into the Startup folder)')
+            self.autostart.setChecked(get_autostart())
+            f.addRow(self.autostart)
         self.notif_sent = W.QCheckBox('Show a popup when something was sent')
         self.notif_sent.setChecked(cfg['notify_sent'])
         self.notif_recv = W.QCheckBox('Show a popup when something was received')
         self.notif_recv.setChecked(cfg['notify_received'])
         self.notif_recv.setToolTip('Errors and rejected items are always shown.')
-        f.addRow('Shared passphrase', self.pp)
         lay.addWidget(g)
 
         g = W.QGroupBox('Notifications')
@@ -1423,6 +2371,12 @@ class SettingsDialog(QtWidgets.QDialog):
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
 
+    def _show_backend(self):
+        fb = self.backend.currentData() == 'firebase'
+        self.fb_group.setVisible(fb)
+        self.nc_group.setVisible(not fb)
+        self.adjustSize()
+
     def _browse(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, 'Save received files to', self.ddir.text())
         if d:
@@ -1430,14 +2384,17 @@ class SettingsDialog(QtWidgets.QDialog):
 
     def _collect(self):
         c = dict(self.cfg)
-        c.update(server_url=self.url.text().strip(), user=self.user.text().strip(),
+        c.update(backend=self.backend.currentData(),
+                 fb_db_url=self.fb_url.text().strip().rstrip('/'), fb_api_key=self.fb_key.text().strip(),
+                 fb_email=self.fb_email.text().strip(),
+                 server_url=self.url.text().strip(), user=self.user.text().strip(),
                  app_password=self.pw.text().strip(), remote_dir=self.rdir.text().strip(),
                  device_name=self.dev.text().strip(),
                  max_size_mb=self.maxsize.value(), receive_enabled=self.recv.isChecked(),
                  apply_to_clipboard=self.apply.isChecked(), set_selection=self.selection.isChecked(),
                  download_dir=os.path.expanduser(self.ddir.text().strip()) or DEFAULTS['download_dir'],
                  use_push=self.push.isChecked(), poll_interval=self.poll.value(),
-                 max_age_min=self.age.value(), passphrase=self.pp.text(),
+                 max_age_min=self.age.value(), use_keyring=self.use_keyring.isChecked(),
                  notify_sent=self.notif_sent.isChecked(),
                  notify_received=self.notif_recv.isChecked())
         text = self.target.currentText().strip()
@@ -1455,43 +2412,87 @@ class SettingsDialog(QtWidgets.QDialog):
         if c['target'] == c['device_name']:
             return 'The target cannot be this device.'
         try:
-            norm_remote_dir(c['remote_dir'])
-            if c['server_url']:
-                check_server_url(c['server_url'])
+            if c['backend'] == 'firebase':
+                check_firebase_url(c['fb_db_url'])
+                check_firebase_api_key(c['fb_api_key'])
+                if not c['fb_email']:
+                    return 'Enter the email of the Firebase user.'
+                if c['max_size_mb'] > FB_MAX_MB:
+                    return f'Firebase stores at most about {FB_MAX_MB:g} MB per item: lower the max. transfer size.'
+            else:
+                norm_remote_dir(c['remote_dir'])
+                if c['server_url']:
+                    check_server_url(c['server_url'])
         except ValueError as e:
             return str(e)
-        if c['passphrase'] and len(c['passphrase']) < 8:
-            return 'Use a passphrase of at least 8 characters (or leave it empty).'
-        if c['passphrase']:
-            try:
-                Crypto(c['passphrase'])
-            except ImportError:
-                return 'Encryption needs the Python package "cryptography".'
         return None
 
-    def _test(self):
+    def _firebase_login(self, c):
+        """Sign in with the entered password (stores only uid + refresh token). Returns an error or None."""
+        if c['backend'] != 'firebase':
+            return None
+        pw = self.fb_pw.text()
+        same_account = (c['fb_email'] == self.cfg['fb_email'] and c['fb_api_key'] == self.cfg['fb_api_key'])
+        if not pw:
+            if c['fb_refresh_token'] and same_account:
+                return None
+            return 'Enter the Firebase password to sign in.'
+        try:
+            res = firebase_sign_in(c['fb_api_key'], c['fb_email'], pw)
+        except Exception as e:
+            return str(e)
+        c['fb_uid'], c['fb_refresh_token'] = res['uid'], res['refresh_token']
+        self.cfg.update(fb_uid=res['uid'], fb_refresh_token=res['refresh_token'],
+                        fb_email=c['fb_email'], fb_api_key=c['fb_api_key'])
+        self.fb_pw.clear()
+        self.fb_pw.setPlaceholderText('signed in - leave empty to keep')
+        return None
+
+    def _checked_config(self):
         c = self._collect()
         err = self._validate(c)
+        if not err:
+            self._busy(True)
+            try:
+                err = self._firebase_login(c)
+            finally:
+                self._busy(False)
         if err:
             QtWidgets.QMessageBox.warning(self, 'ClipSend', err)
+            return None
+        return c
+
+    @staticmethod
+    def _busy(on):
+        if on:
+            QtWidgets.QApplication.setOverrideCursor(QtGui.QCursor(qenum(QtCore.Qt, 'CursorShape', 'WaitCursor')))
+        else:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+    def _test(self):
+        c = self._checked_config()
+        if c is None:
             return
-        QtWidgets.QApplication.setOverrideCursor(QtGui.QCursor(qenum(QtCore.Qt, 'CursorShape', 'WaitCursor')))
+        self._busy(True)
         try:
             devs, push = Engine.test_connection(c)
+            self._busy(False)
             msg = (f'Connection OK.\n\nRegistered devices: {", ".join(devs) or "none yet"}\n'
-                   f'Instant push (notify_push): {"available" if push else "not available, will poll"}')
-            QtWidgets.QApplication.restoreOverrideCursor()
+                   f'Instant push: {"available" if push else "not available, will poll"}')
             QtWidgets.QMessageBox.information(self, 'ClipSend', msg)
         except Exception as e:
-            QtWidgets.QApplication.restoreOverrideCursor()
+            self._busy(False)
             QtWidgets.QMessageBox.warning(self, 'ClipSend', f'Connection failed:\n{e}')
 
     def _save(self):
-        c = self._collect()
-        err = self._validate(c)
-        if err:
-            QtWidgets.QMessageBox.warning(self, 'ClipSend', err)
+        c = self._checked_config()
+        if c is None:
             return
+        if self.autostart is not None and self.autostart.isChecked() != get_autostart():
+            try:
+                set_autostart(self.autostart.isChecked())
+            except OSError as e:
+                QtWidgets.QMessageBox.warning(self, 'ClipSend', f'Could not change autostart:\n{e}')
         self.cfg = _coerce(c)
         self.accept()
 
@@ -1553,9 +2554,14 @@ class TrayApp(QtCore.QObject):
         self.app = app
         self.cfg = load_config()
         self.clip = Clipboard()
-        self.clip.selection = self.cfg['set_selection']
+        self.clip.selection = self.cfg['set_selection'] and not WINDOWS
         self.engine = None
+        self.trust = TrustStore()
+        self.my_key = None
+        self.peers = {}
         self.devices = []
+        self._prompted = set()          # (device, fingerprint) already asked about in this session
+        self._prompt = None
         self.state = 'not configured'
         self.dialog = None
         self._sending = False
@@ -1566,6 +2572,7 @@ class TrayApp(QtCore.QObject):
         self._blink.setInterval(350)
         self._blink.timeout.connect(self._blink_tick)
         self._icon_key = 'offline'
+        self._clip_written = -1e9       # monotonic time of our last clipboard write
 
         self.tray = QtWidgets.QSystemTrayIcon(app_icon('offline'), self)
         self.tray.activated.connect(self._activated)
@@ -1582,16 +2589,19 @@ class TrayApp(QtCore.QObject):
         self.act_recv.setCheckable(True)
         self.act_recv.toggled.connect(self._toggle_recv)
         self.menu.addAction('Open received files').triggered.connect(self._open_downloads)
+        self.act_devices = self.menu.addAction('Devices…')
+        self.act_devices.triggered.connect(self.show_devices)
         self.menu.addAction('Settings…').triggered.connect(self.show_settings)
         self.menu.addSeparator()
         self.menu.addAction('Quit').triggered.connect(self.quit)
         self.menu.aboutToShow.connect(self._update_menu)
         self.tray.setContextMenu(self.menu)
 
-        self.ctl = ControlServer()
+        self.ctl = WinControlServer() if WINDOWS else ControlServer()
         self.ctl.command.connect(self._command)
         self.ctl.start()
 
+        self._unlock()
         self._restart_engine()
         self._update_tooltip()
 
@@ -1604,8 +2614,12 @@ class TrayApp(QtCore.QObject):
             self.state = 'not configured'
             self._update_tooltip()
             return
+        if self.my_key is None:
+            self.state = 'locked: click to unlock'
+            self._update_tooltip()
+            return
         try:
-            self.engine = Engine(self.cfg)
+            self.engine = Engine(self.cfg, self.my_key, self.trust)
         except Exception as e:
             self.state = 'configuration error'
             self.notify('ClipSend: configuration error', clean_display(str(e), 300), error=True)
@@ -1624,9 +2638,132 @@ class TrayApp(QtCore.QObject):
         self.state = s
         self._update_tooltip()
 
-    def _on_devices(self, devs):
-        self.devices = devs
+    def _on_devices(self, peers):
+        self.peers = peers
+        self.devices = sorted(peers)
         self._update_tooltip()
+        self._prompt_new_device()
+
+    def _prompt_new_device(self):
+        """Ask (once per session and key) whether to accept a new or changed device key."""
+        if self._prompt is not None or self.my_key is None:
+            return
+        for dev in pending_devices(self.peers, self.trust):
+            pub = self.peers[dev]
+            if (dev, pub.fingerprint) in self._prompted:
+                continue
+            self._prompted.add((dev, pub.fingerprint))
+            W = QtWidgets.QMessageBox
+            box = W(qenum(W, 'Icon', 'Warning' if self.trust.get(dev) else 'Question'), 'ClipSend: new device',
+                    device_prompt_text(dev, pub, self.trust.get(dev), self.cfg['device_name'],
+                                       self.my_key.public))
+            box.setWindowIcon(app_icon())
+            box.setTextInteractionFlags(qenum(QtCore.Qt, 'TextInteractionFlag', 'TextSelectableByMouse'))
+            accept = box.addButton('Accept', qenum(W, 'ButtonRole', 'AcceptRole'))
+            box.addButton('Not now', qenum(W, 'ButtonRole', 'RejectRole'))
+            box.setWindowFlag(qenum(QtCore.Qt, 'WindowType', 'WindowStaysOnTopHint'))
+            box.setModal(False)
+            box.finished.connect(lambda _=0, b=box, a=accept, d=dev, k=pub: self._prompt_done(b, a, d, k))
+            self._prompt = box
+            box.show()
+            box.raise_()
+            box.activateWindow()
+            return
+
+    def _prompt_done(self, box, accept, dev, pub):
+        self._prompt = None
+        box.deleteLater()
+        if box.clickedButton() is accept and self.peers.get(dev) == pub:
+            self.trust.set(dev, pub)
+            log.info('confirmed device %s (%s)', dev, pub.fingerprint)
+            if self.engine:
+                self.engine.wake()
+        self._update_tooltip()
+        QtCore.QTimer.singleShot(0, self._prompt_new_device)
+
+    # ---- device key ----
+    def _unlock(self):
+        """Load (or create) this device's key. Its password comes from the system keyring
+        (KWallet / Windows Credential Manager) if enabled, otherwise you are asked for it."""
+        use_kr = self.cfg['use_keyring'] and keyring_available()
+        if not os.path.exists(KEY_FILE):
+            return self._create_key()
+        pw = keyring_get() if use_kr else None
+        if pw:
+            try:
+                self.my_key = load_device_key(pw)
+                return True
+            except ValueError as e:
+                log.warning('key password from the system keyring does not fit: %s', e)
+        while True:
+            pw = ask_password(None, 'Unlock ClipSend',
+                              f'Password of the device key of "{self.cfg["device_name"]}":')
+            if pw is None:
+                return False
+            try:
+                self.my_key = load_device_key(pw)
+                break
+            except ValueError as e:
+                QtWidgets.QMessageBox.warning(None, 'ClipSend', f'Could not unlock the key: {e}')
+        if use_kr:
+            self._protect_key_with_keyring()
+        return True
+
+    def _protect_key_with_keyring(self):
+        pw = secrets.token_urlsafe(32)
+        if keyring_set(pw):
+            save_device_key(self.my_key, pw)
+            return True
+        return False
+
+    def _create_key(self):
+        self.my_key = DeviceKey.generate()
+        if self.cfg['use_keyring'] and keyring_available() and self._protect_key_with_keyring():
+            log.info('created a device key (password kept in the system keyring)')
+            return True
+        pw = ask_new_password(None, 'No system keyring (KWallet / Credential Manager) is available.')
+        if pw is None:
+            self.my_key = None
+            return False
+        save_device_key(self.my_key, pw)
+        log.info('created a device key (password protected)')
+        return True
+
+    def _apply_keyring_setting(self):
+        """The keyring setting changed: protect the key the new way."""
+        if self.my_key is None:
+            return
+        if self.cfg['use_keyring']:
+            if not self._protect_key_with_keyring():
+                self.notify('ClipSend', 'Could not use the system keyring; the key password stays as it is.',
+                            error=True)
+            return
+        pw = ask_new_password(None, 'The key password will no longer be kept in the system keyring.')
+        if pw is None:              # cancelled: keep using the keyring
+            self.cfg['use_keyring'] = True
+            save_config(self.cfg)
+            return
+        save_device_key(self.my_key, pw)
+        keyring_delete()
+
+    def show_devices(self):
+        if self.my_key is None:
+            if not self._unlock():
+                return
+            self._restart_engine()
+        dlg = DevicesDialog(self.cfg['device_name'], self.my_key, dict(self.peers), self.trust)
+        try:
+            qexec(dlg)
+            if dlg.new_key_requested:
+                old = self.my_key
+                if not self._create_key():
+                    self.my_key = old
+                self._restart_engine()          # publishes the new key
+        finally:
+            dlg.deleteLater()
+        self._update_tooltip()
+        if self.engine:
+            self.engine.wake()
 
     # ---- tray icon: grey = offline, green = connected, orange = sending, blinking blue = receiving
     def _refresh_icon(self):
@@ -1668,6 +2805,9 @@ class TrayApp(QtCore.QObject):
                f'Left-click: send clipboard to {tgt}')
         if self.devices:
             tip += f'\nOther devices: {", ".join(self.devices)}'
+        pending = pending_devices(self.peers, self.trust)
+        if pending:
+            tip += f'\nWaiting for your confirmation (Devices…): {", ".join(pending)}'
         self.tray.setToolTip(tip)
 
     def _update_menu(self):
@@ -1680,7 +2820,12 @@ class TrayApp(QtCore.QObject):
         if self.devices:
             self.sendto.addSeparator()
         for d in self.devices:
-            self.sendto.addAction(d).triggered.connect(lambda _=False, d=d: self.send(d))
+            _, usable = device_status(d, self.peers.get(d), self.trust.get(d))
+            a = self.sendto.addAction(d if usable else f'{d} (not confirmed)')
+            a.setEnabled(usable)
+            a.triggered.connect(lambda _=False, d=d: self.send(d))
+        n = len(pending_devices(self.peers, self.trust))
+        self.act_devices.setText(f'Devices… ({n} new)' if n else 'Devices…')
         if self.engine:
             self.engine.wake()
 
@@ -1698,6 +2843,10 @@ class TrayApp(QtCore.QObject):
             self.quit()
 
     def send(self, target=None):
+        if self.my_key is None and config_complete(self.cfg):
+            if not self._unlock():
+                return
+            self._restart_engine()
         if not self.engine:
             self.notify('ClipSend', 'Not configured yet – opening settings.', error=True)
             self.show_settings()
@@ -1731,27 +2880,28 @@ class TrayApp(QtCore.QObject):
 
     def _on_received(self, msg):
         sender = msg['from']
+        if msg['kind'] == 'text':
+            body = f'Text from {sender}: “{clean_display(msg["text"], 60)}”'
+            apply = lambda: self.clip.set_text(msg['text'])                     # noqa: E731
+        elif msg['kind'] == 'image':
+            body = f'Image from {sender} ({human_size(len(msg["data"]))})'
+            apply = lambda: self.clip.set_image(msg['mime'], msg['data'])       # noqa: E731
+        else:
+            n = len(msg['paths'])
+            body = (f'{n} item{"s" if n != 1 else ""} from {sender} ({human_size(msg["total"])}), '
+                    f'saved to {clean_display(msg["dest"], 200)}')
+            apply = lambda: self.clip.set_files(msg['paths'])                   # noqa: E731
+        self._start_blink(2.5)
+        self.notify('Clipboard received', body, kind='received')     # before the clipboard write, see _show
+        if not self.cfg['apply_to_clipboard']:
+            return
         try:
-            if msg['kind'] == 'text':
-                if self.cfg['apply_to_clipboard']:
-                    self.clip.set_text(msg['text'])
-                body = f'Text from {sender}: “{clean_display(msg["text"], 60)}”'
-            elif msg['kind'] == 'image':
-                if self.cfg['apply_to_clipboard']:
-                    self.clip.set_image(msg['mime'], msg['data'])
-                body = f'Image from {sender} ({human_size(len(msg["data"]))})'
-            else:
-                if self.cfg['apply_to_clipboard']:
-                    self.clip.set_files(msg['paths'])
-                n = len(msg['paths'])
-                body = (f'{n} item{"s" if n != 1 else ""} from {sender} ({human_size(msg["total"])}), '
-                        f'saved to {clean_display(msg["dest"], 200)}')
+            apply()
         except Exception as e:
             log.exception('applying received item failed')
             self.notify('ClipSend: could not set clipboard', clean_display(str(e), 300), error=True)
-            return
-        self._start_blink(2.5)
-        self.notify('Clipboard received', body, kind='received')
+        finally:
+            self._clip_written = time.monotonic()
 
     def _toggle_recv(self, on):
         self.cfg['receive_enabled'] = bool(on)
@@ -1769,10 +2919,13 @@ class TrayApp(QtCore.QObject):
             self.dialog.activateWindow()
             return
         self.dialog = SettingsDialog(self.cfg, self.devices)
+        old_keyring = self.cfg['use_keyring']
         try:
             if qexec(self.dialog):
                 self.cfg = self.dialog.cfg
-                self.clip.selection = self.cfg['set_selection']
+                if self.cfg['use_keyring'] != old_keyring:
+                    self._apply_keyring_setting()
+                self.clip.selection = self.cfg['set_selection'] and not WINDOWS
                 save_config(self.cfg)
                 self._restart_engine()
                 self._update_tooltip()
@@ -1784,10 +2937,18 @@ class TrayApp(QtCore.QObject):
         if not error and kind and not self.cfg.get(f'notify_{kind}', True):
             return
         log.info('%s: %s', title, html.unescape(body))
-        if not self.tray.isVisible():
-            return
         icon = qenum(QtWidgets.QSystemTrayIcon, 'MessageIcon', 'Warning' if error else 'Information')
-        self.tray.showMessage(title, body, icon, 6000 if error else 3000)
+        self._show(title, body, icon, 6000 if error else 3000)
+
+    def _show(self, title, body, icon, ms):
+        """Show a notification, but not within 2 s after we wrote the clipboard: Plasma's clipboard
+        manager then reads the new content from us, and a notification is a blocking D-Bus call to
+        that same Plasma process. Both would wait for each other until the 25 s D-Bus timeout."""
+        wait = self._clip_written + 2.0 - time.monotonic()
+        if wait > 0:
+            QtCore.QTimer.singleShot(int(wait * 1000) + 50, lambda: self._show(title, body, icon, ms))
+        elif self.tray.isVisible():
+            self.tray.showMessage(title, body, icon, ms)
 
     def show_when_tray_ready(self, tries=0):
         if QtWidgets.QSystemTrayIcon.isSystemTrayAvailable() or tries >= 60:
@@ -1810,6 +2971,25 @@ class TrayApp(QtCore.QObject):
 # --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
+def start_stall_watchdog(app, seconds=10):
+    """Diagnostics: if the UI thread is stuck for `seconds`, write the stacks of all threads to the
+    log. Runs in a C thread, so it works even if the stuck call holds Python's GIL."""
+    try:
+        f = open(LOG_FILE, 'a', encoding='utf-8')
+    except OSError:
+        return
+
+    def arm():
+        f.flush()
+        faulthandler.dump_traceback_later(seconds, exit=False, file=f)
+
+    timer = QtCore.QTimer(app)
+    timer.timeout.connect(arm)
+    timer.start(2000)
+    arm()
+    app._stall_watchdog = (timer, f)
+
+
 def setup_logging(verbose):
     os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
     fmt = logging.Formatter('%(asctime)s %(levelname)s %(message)s', '%Y-%m-%d %H:%M:%S')
@@ -1824,21 +3004,17 @@ def setup_logging(verbose):
 
 
 def main():
-    if not sys.platform.startswith('linux'):
-        print('ClipSend runs on Linux only.', file=sys.stderr)
+    if not (sys.platform.startswith('linux') or WINDOWS):
+        print('ClipSend runs on Linux and Windows.', file=sys.stderr)
         return 1
     ap = argparse.ArgumentParser(prog='clipsend', description='Send your clipboard to your other machines.')
     g = ap.add_mutually_exclusive_group()
     g.add_argument('--send', action='store_true', help='tell the running instance to send the clipboard')
     g.add_argument('--settings', action='store_true', help='open the settings of the running instance')
     g.add_argument('--quit', action='store_true', help='quit the running instance')
-    g.add_argument('--import-legacy', metavar='JSON', help='import credentials.json of the old sync-clip.py')
     ap.add_argument('-v', '--verbose', action='store_true')
     args = ap.parse_args()
 
-    if args.import_legacy:
-        import_legacy(args.import_legacy)
-        return 0
     for cmd in ('send', 'settings', 'quit'):
         if getattr(args, cmd):
             if send_command(cmd):
@@ -1859,7 +3035,10 @@ def main():
     lock = acquire_lock()
     if lock is None:
         print('ClipSend is already running (use --settings / --send / --quit).', file=sys.stderr)
+        if WINDOWS:     # started again by double-click: show something instead of silently exiting
+            send_command('settings')
         return 0
+    start_stall_watchdog(app)
     tray = TrayApp(app)
     tray.show_when_tray_ready()
     log.info('ClipSend %s started (Qt: %s, clipboard: %s)', VERSION, QT_API,

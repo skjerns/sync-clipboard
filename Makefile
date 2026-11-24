@@ -1,6 +1,6 @@
 # ClipSend - per-user install with autostart (KDE Plasma, X11 or Wayland)
 #
-#   make install      install to ~/.local and enable autostart
+#   make install      install to ~/.local, enable autostart, (re)start it
 #   make start|stop|restart
 #   make uninstall    remove program + autostart (keeps ~/.config/clipsend)
 #
@@ -51,9 +51,11 @@ check:
 	@$(PYTHON) -c "import importlib.util as u, sys; sys.exit(not any(u.find_spec(m) for m in ('PySide6','PyQt6','PyQt5')))" \
 		|| { echo "ERROR: need PySide6, PyQt6 or PyQt5"; exit 1; }
 	@$(PYTHON) -c "import cryptography" 2>/dev/null \
-		|| echo "note: 'cryptography' missing - end-to-end encryption (passphrase) unavailable"
+		|| { echo "ERROR: python package 'cryptography' missing (needed for the device keys)"; exit 1; }
+	@$(PYTHON) -c "import keyring" 2>/dev/null \
+		|| echo "note: 'keyring' missing - the key password cannot be kept in KWallet, you will be asked at start"
 	@$(PYTHON) -c "import websocket" 2>/dev/null \
-		|| echo "note: 'websocket-client' missing - instant push unavailable, will poll"
+		|| echo "note: 'websocket-client' missing - Nextcloud notify_push unavailable (Firebase does not need it)"
 	@if [ "$$XDG_SESSION_TYPE" = wayland ] || [ -n "$$WAYLAND_DISPLAY" ]; then \
 		command -v wl-copy >/dev/null && command -v wl-paste >/dev/null \
 		|| { echo "ERROR: Wayland session needs wl-clipboard (apt/dnf/pacman install wl-clipboard)"; exit 1; }; \
@@ -61,18 +63,19 @@ check:
 	@echo "dependencies OK"
 
 install: check
+	@$(PYTHON) -c "compile(open('clipsend.py', encoding='utf-8').read(), 'clipsend.py', 'exec')" \
+		|| { echo "ERROR: clipsend.py is incomplete or broken (still syncing?)"; exit 1; }
+	@$(MAKE) --no-print-directory stop
+	rm -rf $(APPDIR)
 	install -d $(APPDIR) $(BINDIR) $(APPSDIR) $(AUTOSTART) $(ICONDIR)
-	install -m 644 clipsendx.py $(APPDIR)/clipsendx.py
-	rm -f $(APPDIR)/clipsend.py
+	install -m 644 clipsend.py $(APPDIR)/clipsend.py
 	install -m 644 clipsend.svg $(ICONDIR)/clipsend.svg
-	printf '#!/bin/sh\nexec "%s" "%s" "$$@"\n' "$(PYTHON)" "$(APPDIR)/clipsendx.py" > $(LAUNCHER)
+	printf '#!/bin/sh\nexec "%s" "%s" "$$@"\n' "$(PYTHON)" "$(APPDIR)/clipsend.py" > $(LAUNCHER)
 	chmod 755 $(LAUNCHER)
 	echo "$$DESKTOP" > $(APPSDIR)/clipsend.desktop
 	echo "$$DESKTOP" > $(AUTOSTART)/clipsend.desktop
-	@if [ -f credentials.json ]; then $(LAUNCHER) --import-legacy credentials.json; fi
-	@echo
-	@echo "Installed. ClipSend starts automatically at login."
-	@echo "Start it now with 'make start' (or 'make restart' if an old version is running)."
+	@$(MAKE) --no-print-directory start
+	@echo "Installed ClipSend $$(grep -m1 '^VERSION' $(APPDIR)/clipsend.py | tr -dc '0-9.'). It also starts automatically at login."
 
 uninstall: stop
 	rm -f $(LAUNCHER) $(APPSDIR)/clipsend.desktop $(AUTOSTART)/clipsend.desktop $(ICONDIR)/clipsend.svg
@@ -82,8 +85,11 @@ uninstall: stop
 start:
 	@setsid -f $(LAUNCHER) >/dev/null 2>&1 < /dev/null; echo "started"
 
+# --quit asks the running instance to exit; pkill catches one that does not answer
 stop:
-	@-$(LAUNCHER) --quit 2>/dev/null && echo "stopped" || true
+	@-$(LAUNCHER) --quit >/dev/null 2>&1 || true
+	@-pkill -u "$$(id -u)" -f '$(APPDIR)/[^ ]*[.]py' && sleep 1 || true
+	@echo "stopped"
 
 restart: stop
 	@$(MAKE) --no-print-directory start
