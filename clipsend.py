@@ -1522,6 +1522,9 @@ CERT_HINT = ("The server's HTTPS certificate is not trusted, e.g. because a fire
              "the connection. ClipSend does not bypass this; it checks again in 10 minutes.")
 
 
+_RETIRED = []       # stopped engines whose threads have not ended yet (see Engine.stop)
+
+
 class Engine(QtCore.QObject):
     received = Signal(object)        # validated message dict
     receiving = Signal(bool)         # downloading incoming items (tray icon blinks)
@@ -1549,17 +1552,39 @@ class Engine(QtCore.QObject):
         self._send_lock = threading.Lock()
         self._status_lock = threading.Lock()
         self._last_status = None
+        self._threads = []
 
     # ---- lifecycle ----
+    def _spawn(self, target, name, *args):
+        self._threads = [t for t in self._threads if t.is_alive()]
+        th = threading.Thread(target=target, args=args, name=name, daemon=True)
+        self._threads.append(th)
+        th.start()
+
     def start(self):
-        threading.Thread(target=self._poll_loop, name='clipsend-poll', daemon=True).start()
+        self._spawn(self._poll_loop, 'clipsend-poll')
         if self.cfg['use_push'] and self.cfg['receive_enabled']:
-            threading.Thread(target=self._push_loop, name='clipsend-push', daemon=True).start()
+            self._spawn(self._push_loop, 'clipsend-push')
 
     def stop(self):
+        """Stop the threads. A request in progress can take a while to return, so the engine stays
+        referenced until all its threads have ended: freeing the Qt object while a thread may
+        still emit one of its signals crashes."""
         self._stop.set()
         self._wake.set()
         self.t.close_watch()
+        _RETIRED[:] = [e for e in _RETIRED if e.alive()]
+        if self.alive():
+            _RETIRED.append(self)
+
+    def alive(self):
+        return any(t.is_alive() for t in self._threads)
+
+    def join(self, timeout=10.0):
+        end = time.monotonic() + timeout
+        for t in list(self._threads):
+            t.join(max(0.0, end - time.monotonic()))
+        return not self.alive()
 
     def wake(self):
         self._wake.set()
@@ -1783,7 +1808,7 @@ class Engine(QtCore.QObject):
         if not self._send_lock.acquire(blocking=False):
             self._emit(self.error, 'ClipSend', 'Still sending the previous item…')
             return
-        threading.Thread(target=self._send, args=(content, target), daemon=True).start()
+        self._spawn(self._send, 'clipsend-send', content, target)
 
     def _send(self, content, target):
         try:

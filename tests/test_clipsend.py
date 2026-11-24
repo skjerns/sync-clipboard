@@ -316,7 +316,7 @@ def test_autostart_launcher(tmp_path, monkeypatch):
     cs.set_autostart(True)
     code = open(path, encoding='utf-8').read()
     compile(code, path, 'exec')
-    assert os.path.abspath(cs.__file__) in code and 'runpy.run_path' in code
+    assert repr(os.path.abspath(cs.__file__)) in code and 'runpy.run_path' in code
     cs.set_autostart(False)
     assert not os.path.exists(path)
 
@@ -400,11 +400,26 @@ class Recorder(cs.QtCore.QObject):
 KEY_ME, KEY_OTHER = cs.DeviceKey.generate(), cs.DeviceKey.generate()
 
 
+_ENGINES = []
+
+
+@pytest.fixture(autouse=True)
+def _stop_engines():
+    """Every engine is stopped and its threads have ended before the next test starts."""
+    yield
+    while _ENGINES:
+        eng = _ENGINES.pop()
+        eng.stop()
+        assert eng.join(15), 'engine threads did not end'
+    cs._RETIRED.clear()
+
+
 def make_engine(**over):
     cfg = {**cs.DEFAULTS, 'server_url': 'https://cloud.example.com', 'user': 'u', 'app_password': 'p',
            'device_name': 'me', 'use_push': False, 'poll_interval': 0.05, **over}
     eng = cs.Engine(cfg, KEY_ME, MemTrust({'other': KEY_OTHER.public}))
     eng.t = FakeTransport()
+    _ENGINES.append(eng)
     rec = Recorder()
     eng.status.connect(rec.on_status)
     eng._rec = rec                                 # keep alive
@@ -800,3 +815,13 @@ def test_no_notification_right_after_a_clipboard_write(qapp):
     assert len(calls) == 2                                      # deferred, not shown yet
     assert wait_until(lambda: len(calls) == 3, timeout=5)
     assert calls[2][1] - calls[1][1] >= 2.0
+
+
+def test_stopped_engine_stays_referenced_until_its_threads_end(qapp):
+    eng, _ = make_engine()
+    release = threading.Event()
+    eng._spawn(release.wait, 'busy')                # e.g. a request that is still in progress
+    eng.stop()
+    assert eng in cs._RETIRED
+    release.set()
+    assert eng.join(5) and not eng.alive()
