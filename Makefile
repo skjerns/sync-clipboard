@@ -52,6 +52,8 @@ check:
 		|| { echo "ERROR: need PySide6, PyQt6 or PyQt5"; exit 1; }
 	@$(PYTHON) -c "import cryptography" 2>/dev/null \
 		|| { echo "ERROR: python package 'cryptography' missing (needed for the device keys)"; exit 1; }
+	@$(PYTHON) -c "import truststore" 2>/dev/null \
+		|| echo "note: 'truststore' missing - HTTPS uses Python's CA list instead of the system's"
 	@$(PYTHON) -c "import keyring" 2>/dev/null \
 		|| echo "note: 'keyring' missing - the key password cannot be kept in KWallet, you will be asked at start"
 	@$(PYTHON) -c "import websocket" 2>/dev/null \

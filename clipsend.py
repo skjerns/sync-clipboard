@@ -1518,8 +1518,10 @@ class Clipboard:
 # --------------------------------------------------------------------------- #
 # sync engine (network side, runs in background threads)
 # --------------------------------------------------------------------------- #
-CERT_HINT = ("The server's HTTPS certificate is not trusted, e.g. because a firewall inspects "
-             "the connection. ClipSend does not bypass this; it checks again in 10 minutes.")
+CERT_HINT = ("The server's HTTPS certificate is not trusted, e.g. because a firewall inspects the "
+             "connection. ClipSend never bypasses this. If the inspection is legitimate (e.g. your "
+             "institute's firewall), its CA certificate must be in the system's certificate store and "
+             "the Python package 'truststore' installed. ClipSend checks again in 10 minutes.")
 
 
 _RETIRED = []       # stopped engines whose threads have not ended yet (see Engine.stop)
@@ -3015,6 +3017,19 @@ def start_stall_watchdog(app, seconds=10):
     app._stall_watchdog = (timer, f)
 
 
+def use_system_certificates():
+    """Check HTTPS certificates against the operating system's store (Windows certificate store,
+    /etc/ssl on Linux) instead of only Python's bundled list, if 'truststore' is installed. Then a CA
+    that your IT installed (e.g. for a firewall that inspects HTTPS) is trusted as in the browser.
+    Certificates are still always verified."""
+    try:
+        import truststore
+    except ImportError:
+        return 'Python bundle (install truststore to use the system store)'
+    truststore.inject_into_ssl()
+    return 'system store'
+
+
 def setup_logging(verbose):
     os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
     fmt = logging.Formatter('%(asctime)s %(levelname)s %(message)s', '%Y-%m-%d %H:%M:%S')
@@ -3051,6 +3066,7 @@ def main():
             return 1
 
     setup_logging(args.verbose)
+    certs = use_system_certificates()
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName('ClipSend')
     app.setDesktopFileName('clipsend')
@@ -3066,8 +3082,8 @@ def main():
     start_stall_watchdog(app)
     tray = TrayApp(app)
     tray.show_when_tray_ready()
-    log.info('ClipSend %s started (Qt: %s, clipboard: %s)', VERSION, QT_API,
-             'wl-clipboard' if tray.clip.wl else 'Qt')
+    log.info('ClipSend %s started (Qt: %s, clipboard: %s, certificates: %s)', VERSION, QT_API,
+             'wl-clipboard' if tray.clip.wl else 'Qt', certs)
     return qexec(app)
 
 
